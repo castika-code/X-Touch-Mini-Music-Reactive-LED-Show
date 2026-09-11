@@ -1,5 +1,7 @@
 [English](#x-touch-mini-music-reactive-led-show-python) | [한국어](#x-touch-mini-music-reactive-led-show-python---한국어-가이드) | [日本語](#x-touch-mini-music-reactive-led-show-python---日本語ガイド)
 
+<img width="1280" height="640" alt="X-Touch Mini Music-Reactive LED Show" src="https://github.com/user-attachments/assets/7b5e6bbb-038e-48aa-adfc-614ae0614aeb" />
+
 ---
 
 # X-Touch Mini Music-Reactive LED Show (Python)
