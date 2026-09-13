@@ -752,6 +752,58 @@ def open_audio(cfg):
         return None, e
 
 
+class AudioController:
+    """Owns the audio input stream and keeps it open only while it is wanted.
+
+    The microphone must not stay open when nothing can use it, so `update(now, wanted)`
+    opens the stream the first time it is wanted, closes it as soon as it is not, and
+    returns the analyzer to read from (None while the stream is closed). `wanted` is
+    the caller's decision - in the show that is "MIDI device connected and show ON".
+    A failed open is retried every `retry_seconds`, but only while the stream is still
+    wanted, so an unplugged device or a show that is off costs no attempts at all.
+    """
+
+    def __init__(self, cfg, open_fn=None, retry_seconds=AUDIO_RETRY_SECONDS):
+        self.cfg = cfg
+        self.open_fn = open_fn if open_fn is not None else open_audio
+        self.retry_seconds = float(retry_seconds)
+        self.analyzer = None
+        self.last_try = None     # when the last failed open was attempted; None = try at once
+        self.failed = False      # a failure streak is running; its error was already reported
+
+    def update(self, now, wanted):
+        if not wanted:
+            self.close()
+            return None
+        if self.analyzer is None and (self.last_try is None or now - self.last_try >= self.retry_seconds):
+            self._open(now)
+        return self.analyzer
+
+    def _open(self, now):
+        self.last_try = now
+        analyzer, error = self.open_fn(self.cfg)
+        if analyzer is not None:
+            self.analyzer = analyzer
+            self.last_try = None
+            self.failed = False
+            log.info("audio input opened")
+        elif not self.failed:
+            self.failed = True
+            log.error("audio input failed (%s). Retrying every %.0f s "
+                      "(macOS may still be asking for microphone permission).", error, self.retry_seconds)
+        else:
+            log.debug("audio input still unavailable (%s)", error)
+
+    def close(self):
+        """Stop and drop the stream; the next `wanted` update opens a fresh one right away."""
+        analyzer, self.analyzer = self.analyzer, None
+        self.last_try = None
+        self.failed = False
+        if analyzer is not None:
+            analyzer.stop()
+            log.info("audio input closed")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="X-Touch Mini music-reactive LED show (MC mode)")
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
@@ -807,16 +859,11 @@ def main(argv=None):
     show = Show(cfg, send_cc=link.send_cc, send_note=link.send_note)
     link.on_message = show.on_midi
 
-    analyzer = None
-    if not args.no_audio:
-        analyzer, audio_error = open_audio(cfg)
-        if analyzer is None:
-            log.error("audio input failed (%s). Retrying every %.0f s "
-                      "(macOS may still be asking for microphone permission).", audio_error, AUDIO_RETRY_SECONDS)
+    # the microphone is opened only while the device is connected and the show is on
+    audio = AudioController(cfg)
 
     frame = 1.0 / float(cfg["frame_rate"])
     last_check = 0.0
-    last_audio_try = time.monotonic()
     last = time.monotonic()
     silent_since = None
     t_end = time.monotonic() + args.duration if args.duration else None
@@ -829,20 +876,6 @@ def main(argv=None):
             if t_end and now >= t_end:
                 log.info("duration reached, quitting")
                 break
-            if args.verbose and now - last_status >= 5.0 and analyzer:
-                last_status = now
-                log.debug("state=%s fader=%.2f loud=%.2f rel=%.2f db=%.1f gate=%s levels=%s",
-                          show.state, show.fader_scale, analyzer.get_loudness(),
-                          analyzer.get_loudness_rel(), analyzer.get_loud_db(), analyzer.get_gate_status(),
-                          " ".join("%.2f" % v for v in analyzer.get_levels()))
-            if analyzer is None and not args.no_audio and now - last_audio_try >= AUDIO_RETRY_SECONDS:
-                last_audio_try = now
-                analyzer, audio_error = open_audio(cfg)
-                if analyzer is not None:
-                    silent_since = None
-                    log.info("audio input ready")
-                else:
-                    log.debug("audio input still unavailable (%s)", audio_error)
             if now - last_check >= 2.0:
                 last_check = now
                 if link.connected():
@@ -852,10 +885,21 @@ def main(argv=None):
                     show.on_connected()
                 else:
                     log.debug("waiting for MIDI port '%s'", cfg["midi_port_name"])
+            # nothing can use the microphone while the device is away or the show is off
+            wanted = link.connected() and show.enabled and not args.no_audio
+            analyzer = audio.update(now, wanted)
+            if analyzer is None:
+                silent_since = None
+            if args.verbose and now - last_status >= 5.0 and analyzer:
+                last_status = now
+                log.debug("state=%s fader=%.2f loud=%.2f rel=%.2f db=%.1f gate=%s levels=%s",
+                          show.state, show.fader_scale, analyzer.get_loudness(),
+                          analyzer.get_loudness_rel(), analyzer.get_loud_db(), analyzer.get_gate_status(),
+                          " ".join("%.2f" % v for v in analyzer.get_levels()))
             levels = analyzer.get_levels() if analyzer else np.zeros(8)
             loudness = analyzer.get_loudness() if analyzer else 0.0
             loudness_rel = analyzer.get_loudness_rel() if analyzer else None
-            if analyzer and show.enabled:
+            if analyzer:
                 # digital silence, not just a quiet room: a denied microphone reads exactly zero,
                 # while real room noise sits well above the floor even with the gate closed
                 if analyzer.get_loud_db() <= DIGITAL_SILENCE_DB:
@@ -879,8 +923,7 @@ def main(argv=None):
                 show._clear_rings()
                 show._clear_buttons()
                 link.send_note(show.toggle_note, LED_OFF)
-        if analyzer:
-            analyzer.stop()
+        audio.close()
         link.disconnect()
     return 0
 

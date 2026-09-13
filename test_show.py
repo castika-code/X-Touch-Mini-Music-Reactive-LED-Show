@@ -322,4 +322,67 @@ assert fresh["noise_gate_db"] is None and x.DEFAULT_CONFIG["noise_gate_db"] is N
 
 os.remove(path); os.rmdir(tmp)
 
+# ---------------------------------------------------------------------------
+# AudioController: the input stream is open only while it is wanted
+# (device connected AND show ON), so the microphone indicator goes off otherwise
+# ---------------------------------------------------------------------------
+class FakeAnalyzer:
+    def __init__(self): self.stops = 0
+    def stop(self): self.stops += 1
+
+class FakeOpen:
+    """Stands in for open_audio: counts the calls, hands out an analyzer or fails."""
+    def __init__(self, fail=False):
+        self.fail, self.calls, self.made = fail, 0, []
+    def __call__(self, c):
+        self.calls += 1
+        if self.fail:
+            return None, RuntimeError("microphone unavailable")
+        self.made.append(FakeAnalyzer())
+        return self.made[-1], None
+
+def controller(open_fn):
+    return x.AudioController(cfg, open_fn=open_fn, retry_seconds=5.0)
+
+# 31. never wanted -> the stream is never opened, however long the program runs
+op = FakeOpen(); ac = controller(op)
+for t in (0.0, 5.0, 10.0, 60.0):
+    assert ac.update(t, False) is None
+assert op.calls == 0 and ac.analyzer is None
+
+# 32. wanted -> opened once and the same analyzer is kept across updates
+op = FakeOpen(); ac = controller(op)
+a = ac.update(0.0, True)
+assert a is op.made[0] and op.calls == 1
+for t in (0.1, 5.0, 30.0):
+    assert ac.update(t, True) is a
+assert op.calls == 1 and a.stops == 0
+
+# 33. wanted -> not wanted: the analyzer is stopped and dropped; wanting it again reopens at once
+assert ac.update(31.0, False) is None
+assert a.stops == 1 and ac.analyzer is None
+b = ac.update(31.1, True)
+assert b is op.made[1] and b is not a and op.calls == 2 and a.stops == 1
+
+x.log.setLevel(logging.CRITICAL)   # the two tests below log the expected open failure
+
+# 34. a failing open returns None, is not retried before retry_seconds and is retried after
+op = FakeOpen(fail=True); ac = controller(op)
+assert ac.update(100.0, True) is None and op.calls == 1
+assert ac.update(101.0, True) is None and op.calls == 1
+assert ac.update(104.9, True) is None and op.calls == 1
+assert ac.update(105.0, True) is None and op.calls == 2
+op.fail = False
+assert ac.update(110.0, True) is op.made[0] and op.calls == 3
+assert ac.update(115.0, True) is op.made[0] and op.calls == 3
+
+# 35. not wanted while the open keeps failing: no retry attempt at all, however long it waits
+op = FakeOpen(fail=True); ac = controller(op)
+assert ac.update(0.0, True) is None and op.calls == 1
+for t in (5.0, 10.0, 60.0):
+    assert ac.update(t, False) is None
+assert op.calls == 1
+
+x.log.setLevel(logging.NOTSET)
+
 print("ALL TESTS PASSED")
