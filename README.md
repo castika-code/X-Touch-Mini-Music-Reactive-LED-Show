@@ -26,10 +26,13 @@ This guide assumes you are starting from a **fresh Mac with no pre-installed dep
 | Fader | Adjusts sensitivity (bar height). Moving it all the way down turns off display output (the background show remains running). |
 | Layer A or B button (configurable) | Turns the show on and off (configured via `toggle_button`).<br>• **LED off**: Show off<br>• **Blinking**: Show running |
 | Unplugging and replugging device | Reconnects automatically. |
+| Display asleep (screen dark, Mac still awake) | The show stops and the microphone closes until the display wakes again — on the power adapter and on battery alike (`show_when_display_off_on_ac` and `show_when_display_off_on_battery`, both off by default). The Layer LED keeps blinking, so the show is still switched on. Set either one to `true` to keep the show running while the screen is dark on that power source. |
 
 The frequency bands corresponding to the LED rings from left to right are: **60 Hz, 120 Hz, 250 Hz, 500 Hz, 1 kHz, 2 kHz, 4 kHz, and 8 kHz**.
 
 The microphone is only open while the X-Touch Mini is connected **and** the show is on; unplugging the controller or switching the show off with the Layer button closes the audio input, so the orange microphone indicator in the menu bar goes off.
+
+After the Mac wakes from sleep the show re-initializes itself: it sends the MC mode command to the controller, restores the LEDs, and reopens the microphone, so there is nothing to restart by hand.
 
 ---
 
@@ -185,6 +188,8 @@ If you lack a microphone or want to pass direct digital audio, route system outp
 | `toggle_button` | `"A"` | Activation toggle button (`"A"` or `"B"`). |
 | `show_enabled_at_start` | `true` | Automatically starts visualizer when app launches. |
 | `buttons_enabled` | `true` | Enables/disables the two button-row level bars (top = absolute level, bottom = relative level). When false, button LEDs are never touched. |
+| `show_when_display_off_on_ac` | `false` | Keeps the show running while the display is asleep and the power adapter is connected. Off by default: the rings and button LEDs go out and the microphone closes until the display wakes. Set to `true` to keep the show running with the screen dark on AC power. |
+| `show_when_display_off_on_battery` | `false` | Keeps the show running while the display is asleep on battery. Off by default: the rings and button LEDs go out and the microphone closes until the display wakes, saving power. Set to `true` to keep the show running on battery as well. |
 | `bar_max_fall_s` | `2.0` | Time constant (seconds) for dynamic range ceiling decay. |
 | `bar_min_rise_s` | `4.0` | Time constant (seconds) for dynamic range floor rising. |
 | `band_centers_hz` | `60` to `8000` | Center frequencies for the 8 encoder LED bands. |
@@ -276,16 +281,15 @@ Behringer X-Touch Mini 컨트롤러를 위한 음악 반응형 LED 라이트 쇼
 | 노브 조작 및 기타 버튼 입력 | 무시됩니다. LED 쇼는 계속 유지되며 MIDI 본래 기능도 정상 작동합니다. |
 | 음악이 없는 조용한 상태 | 기본적으로 노이즈 게이트가 꺼져 있어 미세한 방 안 소음에도 LED가 움직일 수 있습니다. `calibrate.sh`를 실행하여 게이트를 활성화할 수 있습니다. |
 | 페이더 (Fader) | 민감도(바 높이)를 조절합니다. 끝까지 내리면 배경 쇼는 유지된 채 LED 출력만 꺼집니다. |
-| Layer A / B 버튼 | 쇼를 켜고 끕니다 (`toggle_button`으로 설정 가능).<br>
-
-<br>• **LED 꺼짐**: 쇼 OFF<br>
-
-<br>• **깜빡임**: 쇼 실행 중 |
+| Layer A / B 버튼 | 쇼를 켜고 끕니다 (`toggle_button`으로 설정 가능).<br>• **LED 꺼짐**: 쇼 OFF<br>• **깜빡임**: 쇼 실행 중 |
 | 기기 연결 해제 후 재연결 | 자동으로 재연결됩니다. |
+| 디스플레이 잠자기 (화면만 꺼지고 Mac은 켜진 상태) | 전원 어댑터를 연결했든 배터리로 쓰고 있든, 화면이 다시 켜질 때까지 쇼가 멈추고 마이크가 닫힙니다 (`show_when_display_off_on_ac`와 `show_when_display_off_on_battery`, 둘 다 기본값 꺼짐). Layer LED는 계속 깜빡이므로 쇼 자체는 켜진 상태입니다. 해당 전원 상태에서 화면이 꺼져도 쇼를 유지하려면 각 항목을 `true`로 설정하세요. |
 
 LED 링(왼쪽→오른쪽)에 대응하는 주파수 대역: **60 Hz, 120 Hz, 250 Hz, 500 Hz, 1 kHz, 2 kHz, 4 kHz, 8 kHz**
 
 마이크는 X-Touch Mini가 연결되어 있고 쇼가 켜져 있을 때만 열립니다. 컨트롤러를 뽑거나 Layer 버튼으로 쇼를 끄면 오디오 입력이 닫히고, 메뉴 막대의 주황색 마이크 표시도 꺼집니다.
+
+Mac이 잠자기에서 깨어나면 쇼가 스스로 다시 초기화됩니다. 컨트롤러에 MC 모드 명령을 보내고 LED를 복구한 뒤 마이크를 다시 열기 때문에 손으로 재시작할 것은 없습니다.
 
 ---
 
@@ -389,10 +393,21 @@ Python 3는 macOS Command Line Tools에 포함되어 있습니다. 미설치 시
 | `midi_port_name` | `"X-TOUCH MINI"` | MIDI 포트 검색 문자열입니다. |
 | `audio_input_device` | `"default"` | 오디오 입력 장치명입니다. |
 | `frame_rate` | `30` | 초당 LED 재생 빈도(FPS)입니다. |
+| `decay_per_frame` | `1` | 한 프레임에 바가 내려갈 수 있는 최대 단계 수입니다. |
 | `toggle_button` | `"A"` | 토글 스위치 버튼 (`"A"` 또는 `"B"`). |
-| `buttons_enabled` | `true` | 버튼 LED 레벨 바 활성화 여부입니다. |
-| `band_centers_hz` | `60` ~ `8000` | 8개 엔코더 LED 대역의 중심 주파수입니다. |
-| `noise_gate_db` | `null` | 노이즈 게이트 임계값(dB)입니다. `null`은 게이트 OFF 상태입니다. |
+| `show_enabled_at_start` | `true` | 프로그램이 시작될 때 쇼를 자동으로 켭니다. |
+| `buttons_enabled` | `true` | 버튼 LED 레벨 바 활성화 여부입니다 (상단 = 절대 레벨, 하단 = 상대 레벨). `false`이면 버튼 LED를 건드리지 않습니다. |
+| `show_when_display_off_on_ac` | `false` | 전원 어댑터를 연결한 상태에서 디스플레이가 잠자기일 때도 쇼를 계속 실행합니다. 기본값은 꺼짐이며, LED 링과 버튼 LED가 꺼지고 화면이 다시 켜질 때까지 마이크도 닫힙니다. 화면이 꺼져도 쇼를 유지하려면 `true`로 설정하세요. |
+| `show_when_display_off_on_battery` | `false` | 배터리 상태에서 디스플레이가 잠자기일 때도 쇼를 계속 실행합니다. 기본값은 꺼짐이며, LED 링과 버튼 LED가 꺼지고 화면이 다시 켜질 때까지 마이크도 닫혀 전력을 아낍니다. 배터리에서도 쇼를 유지하려면 `true`로 설정하세요. |
+| `bar_max_fall_s` | `2.0` | 다이내믹 레인지 상한이 내려가는 시간 상수(초)입니다. |
+| `bar_min_rise_s` | `4.0` | 다이내믹 레인지 하한이 올라가는 시간 상수(초)입니다. |
+| `band_centers_hz` | `60`–`8000` | 8개 엔코더 LED 대역의 중심 주파수입니다. |
+| `band_gains` | `[1.0, ...]` | 주파수 대역별 개별 게인 값입니다. |
+| `min_db` / `max_db` | `-60` / `0` | 다이내믹 레인지의 하한과 상한 보정값(dB)입니다. |
+| `fft_size` | `4096` | 분석 윈도 크기입니다. 값이 클수록 저역 정밀도가 높아집니다. |
+| `level_release` | `0.7` | 감쇠 스무딩 계수(0–1)입니다. 값이 클수록 천천히 내려갑니다. |
+| `noise_gate_db` | `null` | `null`은 **노이즈 게이트 OFF**(모든 소리가 LED에 전달됨)입니다. 숫자를 넣으면 dB 임계값으로 게이트가 켜져, 이보다 조용한 입력은 무음으로 간주되어 LED가 꺼집니다. `calibrate.sh`가 이 값을 대신 기록해 주며, 시끄러운 방에서는 값을 올리고(예: `-35`) 조용한 부분이 잘리면 낮추면 됩니다(예: `-55`). 다시 `null`로 되돌리면 게이트가 꺼집니다. |
+| `noise_gate_margin_db` | `4.0` | `--calibrate`와 설정 위저드가 측정한 방 소음에 더하는 여유값입니다. |
 
 `config.json` 수동 수정 후에는 아래 명령어로 안전하게 재시작할 수 있습니다:
 
@@ -407,8 +422,17 @@ Python 3는 macOS Command Line Tools에 포함되어 있습니다. 미설치 시
 
 * **`MIDI port 'X-TOUCH MINI' not found` 발생 시**: USB 연결을 확인하고 다른 DAW 프로그램이 MIDI 포트를 점유하고 있는지 확인하세요.
 * **LED 링이 반응하지 않음**: 기기의 **MC MODE** LED가 켜져 있는지 확인하세요.
-* **프로그램은 돌아가는데 바가 0에 고정됨**: 마이크 권한(`시스템 설정 → 개인정보 보호 및 보안 → 마이크`)에서 **Terminal** 또는 **XTouchShow**가 허용되어 있는지 확인하세요.
-* **주황색 마이크 표시가 꺼지지 않음**: 쇼는 X-Touch Mini가 연결되어 있고 쇼가 켜져 있을 때만 마이크를 유지합니다. Layer 버튼으로 쇼를 끄거나 컨트롤러를 뽑으면 약 2초 안에 표시가 꺼집니다. 그래도 켜져 있으면 다른 앱이 마이크를 사용 중인 것입니다.
+* **토글 버튼 LED가 켜지지 않음**: MIDI 경로가 잡히지 않은 상태입니다. 로그에 `MIDI connected`가 있는지 확인하세요.
+* **프로그램은 돌아가는데 바가 0에 고정됨**: 마이크 권한(`시스템 설정 → 개인정보 보호 및 보안 → 마이크`)에서 **Terminal** 또는 **XTouchShow**가 허용되어 있는지 확인하세요. `-v` 옵션으로 실행하면 실시간 레벨을 볼 수 있습니다 (`gate=off`는 노이즈 게이트가 설정되지 않은 상태, 음악이 나오는데 `gate=False`이면 게이트가 너무 높은 상태입니다).
+* **음악이 없는데 바가 움직임**: 기본값인 노이즈 게이트 OFF 상태라 방 안 소음이 LED까지 전달되는 것입니다. 조용한 방에서 `~/xtouch_show/calibrate.sh`를 실행해 게이트를 켜거나, `config.json`의 `noise_gate_db`를 `-45` 같은 값으로 설정하세요.
+* **음악에는 반응하지 않고 기침 같은 큰 소리에만 반응함**: 노이즈 게이트가 너무 높습니다. 음악과 대화를 멈춘 상태에서 `~/xtouch_show/calibrate.sh`를 다시 실행하거나, `config.json`의 `noise_gate_db`를 낮추고(예: `-40`) 필요하면 `null`로 되돌려 게이트를 끄세요.
+* **주황색 마이크 표시가 꺼지지 않음**: 쇼는 X-Touch Mini가 연결되어 있고 쇼가 켜져 있을 때만 마이크를 유지합니다. Layer 버튼으로 쇼를 끄거나 컨트롤러를 뽑으면 약 2초 안에 표시가 꺼집니다. 그래도 켜져 있으면 다른 앱이 마이크를 사용 중이거나, 수동으로 실행한 두 번째 인스턴스가 돌아가고 있는 것입니다.
+* **바가 너무 작거나 꽉 참**: `config.json`의 `min_db`를 조절하세요 (작게 움직이면 `-50` 또는 `-40`, 꽉 차면 `-70`).
+* **고음역이 잘 반응하지 않음**: `band_gains`의 고역 값을 올리세요 (예: `1.5`, `2.0`).
+* **종료 후에도 링이 꺼진 채로 남음**: 정상 동작입니다. MC 모드의 LED 링은 호스트가 MIDI를 보낼 때만 갱신됩니다.
+* **자동 실행은 되는데 바가 0에 고정됨**: 시스템 마이크 설정에서 **XTouchShow**가 허용되어 있는지 확인하세요.
+* **자동 실행이 시작되지 않음**: `launchctl print gui/$(id -u)/com.dogleg.xtouchshow`로 상태를 확인하거나 `logs/xtouch_show.log`를 읽어 보세요.
+* **로그에 `Operation not permitted`가 보임**: 폴더가 보호된 경로(`바탕화면`, `문서`, 클라우드 동기화 폴더)에 있습니다. `~/xtouch_show`로 옮긴 뒤 `~/xtouch_show/install.sh`를 다시 실행하세요.
 * **자동 실행 삭제 명령어**:
 ```zsh
 ~/xtouch_show/uninstall.sh
@@ -446,7 +470,7 @@ Behringer X-Touch Mini コントローラー用の音楽連動型 LED ライト�
 
 単一の Python ファイルで動作し、個別のアプリをインストールする必要はありません。**macOS 専用**です。
 
-本ガイドは、**依存パッケージがインストールされていないクリーンな Mac** を前提としています。セットアップには約 10〜20 分かかります。
+本ガイドは、**依存パッケージがインストールされていないクリーンな Mac** を前提としています。セットアップには約 10–20 分かかります。
 
 ---
 
@@ -462,10 +486,13 @@ Behringer X-Touch Mini コントローラー用の音楽連動型 LED ライト�
 | フェーダー (Fader) | 感度（バーの高さ）を調整します。一番下まで下げると、バックグラウンドのショーは維持されたまま LED 出力のみが OFF になります。 |
 | Layer A / B ボタン | ショーの ON/OFF を切り替えます（`toggle_button` で設定可能）。<br>• **LED 消灯**: ショー OFF<br>• **点滅**: ショー実行中 |
 | 機器の切断と再接続 | 自動的に再接続されます。 |
+| ディスプレイのスリープ（画面だけが消え、Mac は起動中） | 電源アダプター接続時もバッテリー駆動時も、画面が再び点くまでショーは停止し、マイクも閉じます（`show_when_display_off_on_ac` と `show_when_display_off_on_battery`、どちらもデフォルトは OFF）。Layer LED は点滅し続けるため、ショー自体は ON のままです。その電源状態で画面が消えてもショーを続けたい場合は、各項目を `true` に設定してください。 |
 
 LED リング（左→右）に対応する周波数帯域: **60 Hz, 120 Hz, 250 Hz, 500 Hz, 1 kHz, 2 kHz, 4 kHz, 8 kHz**
 
 マイクは X-Touch Mini が接続されていて、かつショーが ON のときだけ開きます。コントローラーを抜くか Layer ボタンでショーを切るとオーディオ入力が閉じ、メニューバーのオレンジ色のマイク表示も消えます。
+
+Mac がスリープから復帰すると、ショーは自動的に初期化し直します。コントローラーに MC モードコマンドを送り、LED を復元してからマイクを開き直すため、手動で再起動する必要はありません。
 
 ---
 
@@ -565,10 +592,21 @@ Python 3 は macOS Command Line Tools に含まれています。未インスト
 | `midi_port_name` | `"X-TOUCH MINI"` | MIDI ポート検索文字列です。 |
 | `audio_input_device` | `"default"` | オーディオ入力デバイス名です。 |
 | `frame_rate` | `30` | 1秒あたりの LED 描画フレームレート (FPS) です。 |
+| `decay_per_frame` | `1` | 1 フレームでバーが下がる最大ステップ数です。 |
 | `toggle_button` | `"A"` | トグルスイッチボタン (`"A"` または `"B"`). |
-| `buttons_enabled` | `true` | ボタン LED レベルバーの有効/無効設定です。 |
-| `band_centers_hz` | `60` ~ `8000` | 8つのエンコーダー LED 帯域の中心周波数です。 |
-| `noise_gate_db` | `null` | ノイズゲートのしきい値 (dB) です。`null` はゲート OFF の状態です。 |
+| `show_enabled_at_start` | `true` | プログラム起動時にショーを自動的に ON にします。 |
+| `buttons_enabled` | `true` | ボタン LED レベルバーの有効/無効設定です（上段 = 絶対レベル、下段 = 相対レベル）。`false` の場合はボタン LED に一切触れません。 |
+| `show_when_display_off_on_ac` | `false` | 電源アダプター接続時に、ディスプレイがスリープでもショーを継続します。デフォルトは OFF で、LED リングとボタン LED が消え、画面が再び点くまでマイクも閉じます。画面が消えてもショーを続けたい場合は `true` に設定してください。 |
+| `show_when_display_off_on_battery` | `false` | バッテリー駆動時に、ディスプレイがスリープでもショーを継続します。デフォルトは OFF で、LED リングとボタン LED が消え、画面が再び点くまでマイクも閉じて電力を節約します。バッテリーでもショーを続けたい場合は `true` に設定してください。 |
+| `bar_max_fall_s` | `2.0` | ダイナミックレンジ上限が下がる時定数（秒）です。 |
+| `bar_min_rise_s` | `4.0` | ダイナミックレンジ下限が上がる時定数（秒）です。 |
+| `band_centers_hz` | `60`–`8000` | 8つのエンコーダー LED 帯域の中心周波数です。 |
+| `band_gains` | `[1.0, ...]` | 周波数帯域ごとの個別ゲイン値です。 |
+| `min_db` / `max_db` | `-60` / `0` | ダイナミックレンジの下限と上限の補正値 (dB) です。 |
+| `fft_size` | `4096` | 解析ウィンドウのサイズです。値が大きいほど低域の精度が上がります。 |
+| `level_release` | `0.7` | 減衰のスムージング係数 (0–1) です。値が大きいほどゆっくり下がります。 |
+| `noise_gate_db` | `null` | `null` は**ノイズゲート OFF**（すべての音が LED に届く状態）です。数値を入れると dB のしきい値としてゲートが有効になり、これより静かな入力は無音として扱われ LED が消えます。`calibrate.sh` がこの値を書き込んでくれます。騒がしい部屋では値を上げ（例: `-35`）、静かな部分が切れる場合は下げてください（例: `-55`）。`null` に戻すとゲートは再び OFF になります。 |
+| `noise_gate_margin_db` | `4.0` | `--calibrate` とセットアップウィザードが、測定した室内ノイズに加える余裕値です。 |
 
 `config.json` を手動変更した後は、以下のコマンドで安全に再起動できます:
 
@@ -583,8 +621,17 @@ Python 3 は macOS Command Line Tools に含まれています。未インスト
 
 * **`MIDI port 'X-TOUCH MINI' not found` が発生する場合**: USB 接続を確認し、他の DAW ソフトウェアが MIDI ポートを占有していないか確認してください。
 * **LED リングが反応しない**: 本体の **MC MODE** LED が点灯しているか確認してください。
-* **プログラムは動いているがバーが 0 から動かない**: マイク権限 (`システム設定 → プライバシーとセキュリティ → マイク`) で **Terminal** または **XTouchShow** が許可されているか確認してください。
-* **オレンジ色のマイク表示が消えない**: ショーは X-Touch Mini が接続されていて、かつショーが ON のときだけマイクを保持します。Layer ボタンでショーを切るかコントローラーを抜くと、約 2 秒以内に表示が消えます。それでも点いたままなら、別のアプリがマイクを使っています。
+* **トグルボタンの LED が点灯しない**: MIDI 経路が確立していません。ログに `MIDI connected` があるか確認してください。
+* **プログラムは動いているがバーが 0 から動かない**: マイク権限 (`システム設定 → プライバシーとセキュリティ → マイク`) で **Terminal** または **XTouchShow** が許可されているか確認してください。`-v` オプション付きで実行するとリアルタイムのレベルを確認できます（`gate=off` はノイズゲート未設定、音楽が鳴っているのに `gate=False` ならゲートが高すぎる状態です）。
+* **音楽が鳴っていないのにバーが動く**: デフォルトではノイズゲートが OFF のため、室内ノイズが LED まで届いています。静かな部屋で `~/xtouch_show/calibrate.sh` を実行してゲートを有効にするか、`config.json` の `noise_gate_db` を `-45` などに設定してください。
+* **音楽では動かず、咳のような大きな音にだけ反応する**: ノイズゲートが高すぎます。音楽も会話も止めた状態で `~/xtouch_show/calibrate.sh` を実行し直すか、`config.json` の `noise_gate_db` を下げ（例: `-40`）、必要なら `null` に戻してゲートを OFF にしてください。
+* **オレンジ色のマイク表示が消えない**: ショーは X-Touch Mini が接続されていて、かつショーが ON のときだけマイクを保持します。Layer ボタンでショーを切るかコントローラーを抜くと、約 2 秒以内に表示が消えます。それでも点いたままなら、別のアプリがマイクを使っているか、手動で起動した 2 つ目のインスタンスが動いています。
+* **バーが小さすぎる / 振り切れる**: `config.json` の `min_db` を調整してください（小さすぎる場合は `-50` や `-40`、振り切れる場合は `-70`）。
+* **高音域が反応しにくい**: `band_gains` の高域の値を上げてください（例: `1.5`、`2.0`）。
+* **終了後もリングが消えたままになる**: 正常な動作です。MC モードの LED リングは、ホストから MIDI が送られたときにのみ更新されます。
+* **自動起動はしているがバーが 0 から動かない**: システムのマイク設定で **XTouchShow** が許可されているか確認してください。
+* **自動起動が立ち上がらない**: `launchctl print gui/$(id -u)/com.dogleg.xtouchshow` で状態を確認するか、`logs/xtouch_show.log` を読んでください。
+* **ログに `Operation not permitted` が出る**: フォルダが保護されたパス (`デスクトップ`、`書類`、クラウド同期フォルダ) にあります。`~/xtouch_show` へ移動してから `~/xtouch_show/install.sh` を再実行してください。
 * **自動起動の削除コマンド**:
 ```zsh
 ~/xtouch_show/uninstall.sh

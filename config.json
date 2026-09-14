@@ -6,6 +6,8 @@
   "toggle_button": "A",
   "show_enabled_at_start": true,
   "buttons_enabled": true,
+  "show_when_display_off_on_ac": false,
+  "show_when_display_off_on_battery": false,
   "bar_max_fall_s": 2.0,
   "bar_min_rise_s": 4.0,
   "band_centers_hz": [60, 120, 250, 500, 1000, 2000, 4000, 8000],

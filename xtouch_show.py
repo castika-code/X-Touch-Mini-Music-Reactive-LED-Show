@@ -12,9 +12,13 @@ scales bar height (sensitivity). An optional noise gate (off by default) keeps p
 room noise from moving the LEDs. Every other knob and button keeps its normal
 function; the show ignores it.
 
+While the display is asleep the show keeps running on the power adapter and stops on
+battery (both configurable), and it re-initializes itself after the Mac wakes from sleep.
+
 Requires: python-rtmidi, sounddevice, numpy.  See README.md.
 """
 import argparse
+import ctypes
 import json
 import logging
 import os
@@ -43,6 +47,8 @@ FADER_MAX = 16256        # pitch bend max reported by the device (127 << 7)
 LED_ON, LED_BLINK, LED_OFF = 127, 1, 0
 AUDIO_RETRY_SECONDS = 5.0    # macOS can deny the first stream while the mic permission dialog is open
 AUDIO_BLOCKSIZE = 1024       # frames per audio callback; the analyzer's clock unit
+WAKE_JUMP_SECONDS = 3.0      # wall clock running this far ahead of the monotonic clock = the Mac slept
+DEVICE_CHECK_SECONDS = 2.0   # how often the MIDI port, the display and the power source are polled
 
 DEFAULT_CONFIG = {
     "midi_port_name": "X-TOUCH MINI",
@@ -52,6 +58,8 @@ DEFAULT_CONFIG = {
     "toggle_button": "A",
     "show_enabled_at_start": True,
     "buttons_enabled": True,
+    "show_when_display_off_on_ac": False,      # power adapter connected: stop the show while the display is asleep
+    "show_when_display_off_on_battery": False, # on battery: stop the show while the display is asleep
     "bar_max_fall_s": 2.0,
     "bar_min_rise_s": 4.0,
     "band_centers_hz": [60, 120, 250, 500, 1000, 2000, 4000, 8000],
@@ -127,6 +135,17 @@ class Show:
             self._set_toggle_led()
             log.info("device ready | state=%s | toggle=Layer %s (note %d)",
                      self.state, self.cfg["toggle_button"], self.toggle_note)
+
+    def clear_output(self):
+        """Take the rings and the button LEDs out once without changing the ON/OFF state.
+
+        Used while the show is suspended (the display is asleep): the toggle LED is left
+        alone, so it keeps blinking to show the show is still switched ON, and the next
+        `tick` renders from scratch.
+        """
+        with self.lock:
+            self._clear_rings()
+            self._clear_buttons()
 
     # -- input events (called from MIDI thread) ----------------------------
     def on_midi(self, msg):
@@ -804,6 +823,130 @@ class AudioController:
             log.info("audio input closed")
 
 
+# ----------------------------------------------------------------------------
+# System state: sleep/wake, display, power source
+# ----------------------------------------------------------------------------
+class WakeDetector:
+    """Spots a return from system sleep by comparing the two clocks.
+
+    While the Mac sleeps the wall clock keeps counting and the monotonic clock does not,
+    so a loop iteration whose wall-clock delta runs `threshold` seconds ahead of its
+    monotonic delta means the machine has just woken up. `check` reports that once, then
+    starts measuring from the new pair, so it needs no timers and no sleeping to test.
+    """
+
+    def __init__(self, threshold=WAKE_JUMP_SECONDS):
+        self.threshold = float(threshold)
+        self.last_wall = None
+        self.last_mono = None
+
+    def check(self, wall_now, mono_now):
+        last_wall, last_mono = self.last_wall, self.last_mono
+        self.last_wall, self.last_mono = float(wall_now), float(mono_now)
+        if last_wall is None:
+            return False                      # the first call only takes the baseline
+        return (wall_now - last_wall) - (mono_now - last_mono) > self.threshold
+
+
+CF_ENCODING_UTF8 = 0x08000100
+AC_POWER = "AC Power"        # IOPSGetProvidingPowerSourceType: else "Battery Power" / "UPS Power"
+CORE_GRAPHICS = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+IOKIT = "/System/Library/Frameworks/IOKit.framework/IOKit"
+CORE_FOUNDATION = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+
+
+class PowerState:
+    """Reads whether the main display is asleep and whether the Mac runs on battery.
+
+    Both come straight from the macOS C frameworks through ctypes, so no extra package
+    is needed. Anything that goes wrong (a framework that will not load, an unexpected
+    return value) falls back to "display awake, on AC power" - the combination that keeps
+    the show running - and is logged once at DEBUG level.
+    """
+
+    def __init__(self, load=True):
+        self.cg = self.iokit = self.cf = None
+        self.failed = False
+        if load:
+            self._load()
+
+    def _load(self):
+        try:
+            cg = ctypes.CDLL(CORE_GRAPHICS)
+            iokit = ctypes.CDLL(IOKIT)
+            cf = ctypes.CDLL(CORE_FOUNDATION)
+            cg.CGMainDisplayID.restype = ctypes.c_uint32
+            cg.CGDisplayIsAsleep.argtypes = [ctypes.c_uint32]
+            cg.CGDisplayIsAsleep.restype = ctypes.c_int
+            iokit.IOPSCopyPowerSourcesInfo.restype = ctypes.c_void_p
+            iokit.IOPSGetProvidingPowerSourceType.argtypes = [ctypes.c_void_p]
+            iokit.IOPSGetProvidingPowerSourceType.restype = ctypes.c_void_p
+            cf.CFRelease.argtypes = [ctypes.c_void_p]
+            cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                              ctypes.c_long, ctypes.c_uint32]
+            cf.CFStringGetCString.restype = ctypes.c_ubyte
+            self.cg, self.iokit, self.cf = cg, iokit, cf
+        except Exception as e:
+            self._fail(e)
+
+    def display_asleep(self):
+        if self.cg is None:
+            return False
+        try:
+            return bool(self.cg.CGDisplayIsAsleep(self.cg.CGMainDisplayID()))
+        except Exception as e:
+            self._fail(e)
+            return False
+
+    def on_battery(self):
+        if self.iokit is None:
+            return False
+        try:
+            blob = self.iokit.IOPSCopyPowerSourcesInfo()
+            if not blob:
+                return False
+            try:
+                # a "Get" function: the string belongs to the blob and must not be released
+                source = self._cfstring(self.iokit.IOPSGetProvidingPowerSourceType(blob))
+            finally:
+                self.cf.CFRelease(blob)
+            return bool(source) and source != AC_POWER
+        except Exception as e:
+            self._fail(e)
+            return False
+
+    def _cfstring(self, ref):
+        if not ref:
+            return None
+        buf = ctypes.create_string_buffer(64)
+        if not self.cf.CFStringGetCString(ref, buf, len(buf), CF_ENCODING_UTF8):
+            return None
+        return buf.value.decode("utf-8", "replace")
+
+    def _fail(self, error):
+        """Give up for good: every later read takes the fallback without asking again."""
+        self.cg = self.iokit = self.cf = None
+        if not self.failed:
+            self.failed = True
+            log.debug("power state unavailable (%s); assuming the display is on and the "
+                      "power adapter is connected", error)
+
+
+def should_run(enabled, display_asleep, on_battery, cfg):
+    """Whether the show should render right now.
+
+    A show that is switched off never renders. A show that is on renders whenever the
+    display is awake, and while the display is asleep only if the setting for the current
+    power source allows it.
+    """
+    if not enabled:
+        return False
+    if not display_asleep:
+        return True
+    key = "show_when_display_off_on_battery" if on_battery else "show_when_display_off_on_ac"
+    return bool(cfg[key])
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="X-Touch Mini music-reactive LED show (MC mode)")
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
@@ -859,13 +1002,18 @@ def main(argv=None):
     show = Show(cfg, send_cc=link.send_cc, send_note=link.send_note)
     link.on_message = show.on_midi
 
-    # the microphone is opened only while the device is connected and the show is on
+    # the microphone is opened only while the device is connected and the show is running
     audio = AudioController(cfg)
+    power = PowerState()
+    wake = WakeDetector(WAKE_JUMP_SECONDS)
 
     frame = 1.0 / float(cfg["frame_rate"])
     last_check = 0.0
     last = time.monotonic()
     silent_since = None
+    display_asleep = False
+    on_battery = False
+    suspended = False        # switched on, but not rendering because the display is asleep
     t_end = time.monotonic() + args.duration if args.duration else None
     last_status = 0.0
     log.info("started | fps=%s toggle=Layer %s | Ctrl-C to quit",
@@ -876,8 +1024,18 @@ def main(argv=None):
             if t_end and now >= t_end:
                 log.info("duration reached, quitting")
                 break
-            if now - last_check >= 2.0:
+            if wake.check(time.time(), now):
+                # after a system sleep the audio stream is stale and the controller may have
+                # been reset: drop the stream and set the device up again from scratch
+                log.info("system woke up, reinitializing")
+                audio.close()
+                if link.connected():
+                    show.on_connected()
+                last = now
+            if now - last_check >= DEVICE_CHECK_SECONDS:
                 last_check = now
+                display_asleep = power.display_asleep()
+                on_battery = power.on_battery()
                 if link.connected():
                     if not link.still_present():
                         link.disconnect()
@@ -885,8 +1043,19 @@ def main(argv=None):
                     show.on_connected()
                 else:
                     log.debug("waiting for MIDI port '%s'", cfg["midi_port_name"])
-            # nothing can use the microphone while the device is away or the show is off
-            wanted = link.connected() and show.enabled and not args.no_audio
+            running = should_run(show.enabled, display_asleep, on_battery, cfg)
+            if not show.enabled:
+                suspended = False            # switched off by hand: not a display suspension
+            elif not running and not suspended:
+                suspended = True
+                if link.connected():
+                    show.clear_output()      # the toggle LED keeps blinking: the show stays ON
+                log.info("show suspended (display off, on %s)", "battery" if on_battery else "AC power")
+            elif running and suspended:
+                suspended = False
+                log.info("show resumed")
+            # nothing can use the microphone while the device is away or the show is not running
+            wanted = link.connected() and running and not args.no_audio
             analyzer = audio.update(now, wanted)
             if analyzer is None:
                 silent_since = None
@@ -911,7 +1080,7 @@ def main(argv=None):
                         silent_since = now
                 else:
                     silent_since = None
-            if link.connected():
+            if link.connected() and running:
                 show.tick(now - last, levels, loudness, loudness_rel)
             last = now
             time.sleep(max(0.0, frame - (time.monotonic() - now)))

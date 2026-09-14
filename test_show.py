@@ -385,4 +385,56 @@ assert op.calls == 1
 
 x.log.setLevel(logging.NOTSET)
 
+# ---------------------------------------------------------------------------
+# sleep/wake and the display/power settings
+# ---------------------------------------------------------------------------
+
+# 36. WakeDetector: only wall-clock time running ahead of the monotonic clock is a wake
+wd = x.WakeDetector(x.WAKE_JUMP_SECONDS)
+assert wd.check(1000.0, 500.0) is False               # the first call only takes the baseline
+for i in (1, 2, 3):
+    assert wd.check(1000.0 + i, 500.0 + i) is False   # both clocks advance together
+assert wd.check(1014.0, 504.0) is True                # 11 s wall time against 1 s monotonic
+assert wd.check(1015.0, 505.0) is False               # reported once, then measured afresh
+assert wd.check(1018.0, 506.0) is False               # 2 s jump: below the 3 s threshold
+assert x.WakeDetector(3.0).check(0.0, 0.0) is False
+
+# 37. should_run: the show stops only while the display is asleep and the setting for the
+#     current power source says so
+run = x.should_run
+assert cfg["show_when_display_off_on_ac"] is False
+assert cfg["show_when_display_off_on_battery"] is False
+for asleep in (False, True):
+    for battery in (False, True):
+        assert run(False, asleep, battery, cfg) is False       # switched off stays off
+assert run(True, False, False, cfg) is True
+assert run(True, False, True, cfg) is True             # display on: the power source does not matter
+assert run(True, True, False, cfg) is False            # display off on AC: stops by default
+assert run(True, True, True, cfg) is False             # display off on battery: stops
+swapped = dict(cfg, show_when_display_off_on_ac=True, show_when_display_off_on_battery=True)
+assert run(True, True, False, swapped) is True
+assert run(True, True, True, swapped) is True
+assert run(True, False, False, swapped) is True and run(True, False, True, swapped) is True
+ac_only = dict(cfg, show_when_display_off_on_ac=True)
+assert run(True, True, False, ac_only) is True         # display off on AC: kept on by the setting
+assert run(True, True, True, ac_only) is False         # battery still follows its own setting
+
+# 38. suspending: the rings and button LEDs go out once while the show stays ON, the toggle
+#     LED is left blinking, and the next tick renders again
+sent.clear()
+s5 = x.Show(cfg, cc, note); s5.on_connected()
+for _ in range(12): s5.tick(0.03, lv, 1.0, 1.0)
+sent.clear(); s5.clear_output()
+assert s5.state == "ON" and s5.enabled is True
+assert len([s for s in rings() if s[2] == 32]) == 8
+assert sorted(btn_sent(x.BUTTON_NOTES, 0)) == sorted(x.BUTTON_NOTES)
+assert not any(s[0] == "note" and s[1] == 84 for s in sent)    # the toggle LED is not touched
+sent.clear(); s5.tick(0.03, lv, 1.0, 1.0)
+assert last_ring(0) == 11 and last_ring(3) == round(0.5*11)
+assert sorted(btn_sent(TOP, 127)) == sorted(TOP)
+
+# 39. PowerState falls back to "display on, AC power" when the frameworks are unavailable
+ps = x.PowerState(load=False)
+assert ps.display_asleep() is False and ps.on_battery() is False
+
 print("ALL TESTS PASSED")
