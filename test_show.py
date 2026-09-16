@@ -330,11 +330,19 @@ class FakeAnalyzer:
     def __init__(self): self.stops = 0
     def stop(self): self.stops += 1
 
+import threading as _threading, time as _time
+
 class FakeOpen:
-    """Stands in for open_audio: counts the calls, hands out an analyzer or fails."""
-    def __init__(self, fail=False):
-        self.fail, self.calls, self.made = fail, 0, []
+    """Stands in for open_audio: counts the calls, hands out an analyzer or fails.
+
+    `gate`, when given, is a threading.Event the open waits for, so a test can hold the
+    open thread inside open_fn and watch update() carry on without it.
+    """
+    def __init__(self, fail=False, gate=None):
+        self.fail, self.calls, self.made, self.gate = fail, 0, [], gate
     def __call__(self, c):
+        if self.gate is not None:
+            self.gate.wait(10.0)
         self.calls += 1
         if self.fail:
             return None, RuntimeError("microphone unavailable")
@@ -344,41 +352,91 @@ class FakeOpen:
 def controller(open_fn):
     return x.AudioController(cfg, open_fn=open_fn, retry_seconds=5.0)
 
+def delivered(ac, timeout=10.0):
+    """Wait until the open thread the last update() started has handed its result over."""
+    end = _time.time() + timeout
+    while ac.opening and ac.result is None and _time.time() < end:
+        _time.sleep(0.002)
+    return ac.result is not None
+
 # 31. never wanted -> the stream is never opened, however long the program runs
 op = FakeOpen(); ac = controller(op)
 for t in (0.0, 5.0, 10.0, 60.0):
     assert ac.update(t, False) is None
-assert op.calls == 0 and ac.analyzer is None
+assert op.calls == 0 and ac.analyzer is None and ac.opening is False
 
-# 32. wanted -> opened once and the same analyzer is kept across updates
+# 32. wanted -> the open runs on its own thread: the first update returns None and the
+#     analyzer is handed out by the update that follows the open
 op = FakeOpen(); ac = controller(op)
-a = ac.update(0.0, True)
-assert a is op.made[0] and op.calls == 1
-for t in (0.1, 5.0, 30.0):
+assert ac.update(0.0, True) is None and ac.opening is True
+assert delivered(ac)
+a = ac.update(0.1, True)
+assert a is op.made[0] and op.calls == 1 and ac.opening is False
+for t in (0.2, 5.0, 30.0):
     assert ac.update(t, True) is a
 assert op.calls == 1 and a.stops == 0
 
 # 33. wanted -> not wanted: the analyzer is stopped and dropped; wanting it again reopens at once
 assert ac.update(31.0, False) is None
 assert a.stops == 1 and ac.analyzer is None
-b = ac.update(31.1, True)
+assert ac.update(31.1, True) is None and ac.opening is True
+assert delivered(ac)
+b = ac.update(31.2, True)
 assert b is op.made[1] and b is not a and op.calls == 2 and a.stops == 1
+
+# 34. an open that blocks never blocks update(): it keeps returning None, only one thread
+#     is ever started, and the analyzer arrives once the open returns
+gate = _threading.Event()
+op = FakeOpen(gate=gate); ac = controller(op)
+started = _time.time()
+for t in (0.0, 0.1, 5.0, 10.0):
+    assert ac.update(t, True) is None
+assert _time.time() - started < 1.0        # no update waited for the blocked open
+assert op.calls == 0 and ac.opening is True
+gate.set()
+assert delivered(ac)
+c = ac.update(10.1, True)
+assert c is op.made[0] and op.calls == 1   # one open thread only, however many updates ran
+
+# 35. an open abandoned while it is in flight: the analyzer that arrives late is stopped
+#     instead of used, and the next time it is wanted a fresh open starts
+gate = _threading.Event()
+op = FakeOpen(gate=gate); ac = controller(op)
+assert ac.update(0.0, True) is None and ac.opening is True
+assert ac.update(0.1, False) is None and ac.abandoned is True
+gate.set()
+assert delivered(ac)
+assert ac.update(0.2, False) is None
+assert op.made[0].stops == 1 and ac.analyzer is None and ac.opening is False
+assert ac.update(0.3, True) is None and ac.opening is True
+assert delivered(ac)
+assert ac.update(0.4, True) is op.made[1] and op.calls == 2
 
 x.log.setLevel(logging.CRITICAL)   # the two tests below log the expected open failure
 
-# 34. a failing open returns None, is not retried before retry_seconds and is retried after
+# 36. a failing open returns None, is not retried before retry_seconds counted from the
+#     end of the attempt, and is retried after
 op = FakeOpen(fail=True); ac = controller(op)
-assert ac.update(100.0, True) is None and op.calls == 1
+assert ac.update(100.0, True) is None
+assert delivered(ac)
+assert ac.update(100.0, True) is None and op.calls == 1   # the failure is picked up at 100.0
 assert ac.update(101.0, True) is None and op.calls == 1
 assert ac.update(104.9, True) is None and op.calls == 1
 assert ac.update(105.0, True) is None and op.calls == 2
+assert delivered(ac)
+assert ac.update(110.0, True) is None and op.calls == 2   # second failure collected at 110.0
 op.fail = False
-assert ac.update(110.0, True) is op.made[0] and op.calls == 3
-assert ac.update(115.0, True) is op.made[0] and op.calls == 3
+assert ac.update(114.9, True) is None and op.calls == 2
+assert ac.update(115.0, True) is None and op.calls == 3
+assert delivered(ac)
+assert ac.update(115.1, True) is op.made[0]
+assert ac.update(120.0, True) is op.made[0] and op.calls == 3
 
-# 35. not wanted while the open keeps failing: no retry attempt at all, however long it waits
+# 37. not wanted while the open keeps failing: no retry attempt at all, however long it waits
 op = FakeOpen(fail=True); ac = controller(op)
-assert ac.update(0.0, True) is None and op.calls == 1
+assert ac.update(0.0, True) is None
+assert delivered(ac)
+assert ac.update(0.1, True) is None and op.calls == 1
 for t in (5.0, 10.0, 60.0):
     assert ac.update(t, False) is None
 assert op.calls == 1
@@ -389,7 +447,7 @@ x.log.setLevel(logging.NOTSET)
 # sleep/wake and the display/power settings
 # ---------------------------------------------------------------------------
 
-# 36. WakeDetector: only wall-clock time running ahead of the monotonic clock is a wake
+# 38. WakeDetector: only wall-clock time running ahead of the monotonic clock is a wake
 wd = x.WakeDetector(x.WAKE_JUMP_SECONDS)
 assert wd.check(1000.0, 500.0) is False               # the first call only takes the baseline
 for i in (1, 2, 3):
@@ -399,7 +457,7 @@ assert wd.check(1015.0, 505.0) is False               # reported once, then meas
 assert wd.check(1018.0, 506.0) is False               # 2 s jump: below the 3 s threshold
 assert x.WakeDetector(3.0).check(0.0, 0.0) is False
 
-# 37. should_run: the show stops only while the display is asleep and the setting for the
+# 39. should_run: the show stops only while the display is asleep and the setting for the
 #     current power source says so
 run = x.should_run
 assert cfg["show_when_display_off_on_ac"] is False
@@ -419,7 +477,7 @@ ac_only = dict(cfg, show_when_display_off_on_ac=True)
 assert run(True, True, False, ac_only) is True         # display off on AC: kept on by the setting
 assert run(True, True, True, ac_only) is False         # battery still follows its own setting
 
-# 38. suspending: the rings and button LEDs go out once while the show stays ON, the toggle
+# 40. suspending: the rings and button LEDs go out once while the show stays ON, the toggle
 #     LED is left blinking, and the next tick renders again
 sent.clear()
 s5 = x.Show(cfg, cc, note); s5.on_connected()
@@ -433,8 +491,147 @@ sent.clear(); s5.tick(0.03, lv, 1.0, 1.0)
 assert last_ring(0) == 11 and last_ring(3) == round(0.5*11)
 assert sorted(btn_sent(TOP, 127)) == sorted(TOP)
 
-# 39. PowerState falls back to "display on, AC power" when the frameworks are unavailable
+# 41. PowerState falls back to "display on, AC power" when the frameworks are unavailable
 ps = x.PowerState(load=False)
 assert ps.display_asleep() is False and ps.on_battery() is False
+
+# ---------------------------------------------------------------------------
+# DevicePoller: the blocking system questions are answered off the main loop
+# ---------------------------------------------------------------------------
+import threading, time
+
+# 42. poll_once reads every probe once and publishes the answers with a fresh timestamp
+probe = {"present": False, "asleep": False, "battery": False, "calls": 0}
+
+def probe_present():
+    probe["calls"] += 1
+    return probe["present"]
+
+dp = x.DevicePoller(probe_present, lambda: probe["asleep"], lambda: probe["battery"], interval=0.01)
+assert dp.present is False and dp.display_asleep is False and dp.on_battery is False
+before = dp.last_update
+probe.update(present=True, asleep=True, battery=True)
+dp.poll_once()
+assert dp.present is True and dp.display_asleep is True and dp.on_battery is True
+assert dp.last_update >= before and probe["calls"] == 1
+
+# 43. a probe that raises keeps the last answer instead of stopping the show
+answers = [True, RuntimeError("CoreMIDI is busy")]
+
+def flaky():
+    answer = answers.pop(0)
+    if isinstance(answer, Exception):
+        raise answer
+    return answer
+
+dp2 = x.DevicePoller(flaky, lambda: False, lambda: False)
+dp2.poll_once(); assert dp2.present is True
+dp2.poll_once(); assert dp2.present is True          # the failed question changed nothing
+
+# 44. the thread keeps polling on its own and stop() ends it
+dp3 = x.DevicePoller(lambda: True, lambda: False, lambda: False, interval=0.01)
+stamp = dp3.last_update
+dp3.start()
+for _ in range(200):
+    if dp3.present and dp3.last_update > stamp:
+        break
+    time.sleep(0.01)
+assert dp3.present is True and dp3.last_update > stamp
+dp3.stop(); dp3.join(2.0)
+assert not dp3.is_alive()
+
+# ---------------------------------------------------------------------------
+# watchdog: a main loop or a poller that stops making progress ends the process
+# ---------------------------------------------------------------------------
+
+# 45. stall_check: healthy, main loop stalled, device poll stalled
+assert x.stall_check(100.0, 99.0, 99.0, 15.0, 30.0) is None
+assert x.stall_check(100.0, 85.0, 70.0, 15.0, 30.0) is None      # exactly at both limits
+loop_stall = x.stall_check(100.0, 80.0, 99.0, 15.0, 30.0)
+assert loop_stall == "main loop stalled for 20 s, exiting so launchd restarts the show", loop_stall
+poll_stall = x.stall_check(100.0, 99.0, 60.0, 15.0, 30.0)
+assert poll_stall == "device poll stalled for 40 s, exiting so launchd restarts the show", poll_stall
+assert "main loop" in x.stall_check(100.0, 80.0, 60.0, 15.0, 30.0)   # the loop is reported first
+now = 1000.0
+assert x.stall_check(now, now - x.WATCHDOG_SECONDS - 1, now) is not None       # default limits
+assert x.stall_check(now, now, now - x.POLL_STALL_SECONDS - 1) is not None
+assert x.stall_check(now, now - 1.0, now - 1.0) is None
+
+# 46. the watchdog thread reports a stalled main loop and stops the program (exit injected)
+x.log.setLevel(logging.CRITICAL)      # the expected stall is logged as an error
+fired = threading.Event()
+wdog = x.Watchdog(lambda: time.monotonic() - 60.0, time.monotonic, interval=0.01,
+                  on_stall=fired.set)
+wdog.start()
+assert fired.wait(5.0)
+wdog.join(2.0); assert not wdog.is_alive()
+
+# 47. healthy clocks: the watchdog never fires and stop() ends it
+never = threading.Event()
+wok = x.Watchdog(time.monotonic, time.monotonic, interval=0.01, on_stall=never.set)
+wok.start()
+assert not never.wait(0.2)
+wok.stop(); wok.join(2.0); assert not wok.is_alive()
+x.log.setLevel(logging.NOTSET)
+
+# 48. Heartbeat: every beat moves the value forward
+hb = x.Heartbeat(); first = hb.value
+time.sleep(0.01); hb.beat()
+assert hb.value > first
+
+# ---------------------------------------------------------------------------
+# MidiLink: the port list is read through one long-lived probe pair
+# ---------------------------------------------------------------------------
+import sys as _sys, types as _types
+
+PORT_LIST = ["IAC Driver Bus 1", "X-TOUCH MINI"]
+made = {"MidiIn": 0, "MidiOut": 0}
+
+class FakePort:
+    """Every construction is counted: one object here = one CoreMIDI client."""
+    kind = None
+    def __init__(self):
+        made[self.kind] += 1
+        self.scans = 0
+        self.opened = None
+    def get_ports(self): self.scans += 1; return list(PORT_LIST)
+    def open_port(self, i): self.opened = i
+    def ignore_types(self, **kw): pass
+    def set_callback(self, cb): self.cb = cb
+    def close_port(self): self.opened = None
+    def send_message(self, msg): pass
+
+class FakeMidiIn(FakePort): kind = "MidiIn"
+class FakeMidiOut(FakePort): kind = "MidiOut"
+
+fake_rtmidi = _types.ModuleType("rtmidi")
+fake_rtmidi.MidiIn, fake_rtmidi.MidiOut = FakeMidiIn, FakeMidiOut
+_sys.modules["rtmidi"] = fake_rtmidi
+
+# 49. one probe pair is built at startup and answers every later port scan
+link = x.MidiLink("X-TOUCH MINI", on_message=lambda m: None)
+assert made == {"MidiIn": 1, "MidiOut": 1}, made
+probe_in, probe_out = link.probe_in, link.probe_out
+for _ in range(5):
+    assert link.still_present() is True
+assert made == {"MidiIn": 1, "MidiOut": 1}, made         # no new CoreMIDI client per poll
+assert probe_out.scans == 5 and (link.probe_in, link.probe_out) == (probe_in, probe_out)
+
+# 50. connecting opens the real ports on their own objects; the probes stay the same two
+assert link.try_connect() is True
+assert made == {"MidiIn": 2, "MidiOut": 2}, made
+assert (link.probe_in, link.probe_out) == (probe_in, probe_out)
+assert link.midi_in is not probe_in and link.midi_out is not probe_out
+assert link.midi_out.opened == 1 and link.connected() is True
+assert probe_in.scans == 1 and probe_out.scans == 6      # try_connect scanned through the probes
+
+# 51. a device that is gone: the probes report it without building anything new
+PORT_LIST[:] = ["IAC Driver Bus 1"]
+assert link.still_present() is False
+link.disconnect()
+assert link.connected() is False and made == {"MidiIn": 2, "MidiOut": 2}, made
+assert link.try_connect() is False and made == {"MidiIn": 2, "MidiOut": 2}, made
+
+del _sys.modules["rtmidi"]
 
 print("ALL TESTS PASSED")

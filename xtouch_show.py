@@ -49,6 +49,11 @@ AUDIO_RETRY_SECONDS = 5.0    # macOS can deny the first stream while the mic per
 AUDIO_BLOCKSIZE = 1024       # frames per audio callback; the analyzer's clock unit
 WAKE_JUMP_SECONDS = 3.0      # wall clock running this far ahead of the monotonic clock = the Mac slept
 DEVICE_CHECK_SECONDS = 2.0   # how often the MIDI port, the display and the power source are polled
+AUDIO_CLOSE_TIMEOUT = 3.0    # how long closing the audio stream may take before it is abandoned
+WATCHDOG_SECONDS = 15.0      # no main-loop iteration for this long = the loop is stuck
+WATCHDOG_CHECK_SECONDS = 5.0 # how often the watchdog compares the clocks
+POLL_STALL_SECONDS = 30.0    # no finished device poll for this long = the poller is stuck
+EXIT_STALLED = 3             # exit code the watchdog uses; launchd KeepAlive restarts the show
 
 DEFAULT_CONFIG = {
     "midi_port_name": "X-TOUCH MINI",
@@ -459,6 +464,16 @@ def calibrate_noise(cfg, seconds=NOISE_CALIBRATION_SECONDS, samples=None, stream
 # MIDI I/O with hot-plug handling
 # ----------------------------------------------------------------------------
 class MidiLink:
+    """The MIDI ports of the device, with the port list read through one long-lived pair.
+
+    Every `rtmidi.MidiIn()` / `MidiOut()` is a new CoreMIDI client, and asking a fresh
+    client for its port names has to look every endpoint up again - which can block for
+    a long time while the USB bus re-enumerates (a Thunderbolt display waking the hub
+    the device hangs off). The two probe objects below are created once and answer every
+    later port scan; the ports that are really opened stay separate objects, so closing
+    them never disturbs the scanning.
+    """
+
     def __init__(self, port_name, on_message):
         import rtmidi
         self.rtmidi = rtmidi
@@ -467,6 +482,8 @@ class MidiLink:
         self.midi_in = None
         self.midi_out = None
         self.lock = threading.Lock()
+        self.probe_in = rtmidi.MidiIn()      # never opened: used only to list the ports
+        self.probe_out = rtmidi.MidiOut()
 
     def _find(self, ports):
         for i, p in enumerate(ports):
@@ -481,21 +498,22 @@ class MidiLink:
         return self.midi_out is not None
 
     def try_connect(self):
-        mi, mo = self.rtmidi.MidiIn(), self.rtmidi.MidiOut()
-        ii, oi = self._find(mi.get_ports()), self._find(mo.get_ports())
+        in_ports, out_ports = self.probe_in.get_ports(), self.probe_out.get_ports()
+        ii, oi = self._find(in_ports), self._find(out_ports)
         if ii is None or oi is None:
             return False
+        mi, mo = self.rtmidi.MidiIn(), self.rtmidi.MidiOut()
         mi.open_port(ii)
         mi.ignore_types(sysex=True, timing=True, active_sense=True)
         mi.set_callback(lambda event, data=None: self.on_message(event[0]))
         mo.open_port(oi)
         with self.lock:
             self.midi_in, self.midi_out = mi, mo
-        log.info("MIDI connected: '%s'", mo.get_ports()[oi])
+        log.info("MIDI connected: '%s'", out_ports[oi])
         return True
 
     def still_present(self):
-        return self._find(self.rtmidi.MidiOut().get_ports()) is not None
+        return self._find(self.probe_out.get_ports()) is not None
 
     def disconnect(self):
         with self.lock:
@@ -758,6 +776,30 @@ def ring_test(link):
     log.info("ring test done (all rings swept 0->11->0, Layer A on / B blink for 1 s)")
 
 
+def stop_analyzer(analyzer, timeout=AUDIO_CLOSE_TIMEOUT):
+    """Stop an analyzer's stream without ever blocking the caller for long.
+
+    Closing a CoreAudio stream normally takes milliseconds, but it can hang when the
+    interface behind it disappears (a display that hosts the microphone going to sleep).
+    The close therefore runs on a daemon thread: after `timeout` the stream is abandoned
+    - one leaked stream object costs far less than a frozen show. Returns True when the
+    close finished in time.
+    """
+    done = threading.Event()
+
+    def run():
+        try:
+            analyzer.stop()
+        finally:
+            done.set()
+
+    threading.Thread(target=run, name="audio-close", daemon=True).start()
+    if done.wait(timeout):
+        return True
+    log.warning("audio stream did not close in time; abandoning it")
+    return False
+
+
 def open_audio(cfg):
     """Build and start a SpectrumAnalyzer. Returns (analyzer, None) or (None, exception)."""
     analyzer = None
@@ -767,7 +809,7 @@ def open_audio(cfg):
         return analyzer, None
     except Exception as e:
         if analyzer is not None:
-            analyzer.stop()
+            stop_analyzer(analyzer)
         return None, e
 
 
@@ -780,33 +822,76 @@ class AudioController:
     the caller's decision - in the show that is "MIDI device connected and show ON".
     A failed open is retried every `retry_seconds`, but only while the stream is still
     wanted, so an unplugged device or a show that is off costs no attempts at all.
+
+    Opening runs on a daemon thread and `update` never waits for it: the first open after
+    the app bundle was rebuilt can sit inside CoreAudio for half a minute while macOS
+    re-evaluates the microphone permission, and a main loop blocked that long is a stalled
+    show the watchdog would kill. Only one open is ever in flight; a stream that arrives
+    after it stopped being wanted is stopped instead of used.
     """
 
-    def __init__(self, cfg, open_fn=None, retry_seconds=AUDIO_RETRY_SECONDS):
+    def __init__(self, cfg, open_fn=None, retry_seconds=AUDIO_RETRY_SECONDS,
+                 close_timeout=AUDIO_CLOSE_TIMEOUT):
         self.cfg = cfg
         self.open_fn = open_fn if open_fn is not None else open_audio
         self.retry_seconds = float(retry_seconds)
+        self.close_timeout = float(close_timeout)
         self.analyzer = None
-        self.last_try = None     # when the last failed open was attempted; None = try at once
+        self.last_try = None     # when the last open finished failing; None = try at once
         self.failed = False      # a failure streak is running; its error was already reported
+        self.lock = threading.Lock()
+        self.opening = False     # an open thread is in flight; its result is not collected yet
+        self.abandoned = False   # that open is no longer wanted: stop whatever it returns
+        self.result = None       # (analyzer, error) handed over by the open thread
 
     def update(self, now, wanted):
+        self._collect(now)       # a finished open is taken over (or thrown away) either way
         if not wanted:
             self.close()
             return None
-        if self.analyzer is None and (self.last_try is None or now - self.last_try >= self.retry_seconds):
-            self._open(now)
+        if self.analyzer is None and not self.opening and (
+                self.last_try is None or now - self.last_try >= self.retry_seconds):
+            self._start_open()
         return self.analyzer
 
-    def _open(self, now):
-        self.last_try = now
-        analyzer, error = self.open_fn(self.cfg)
+    def _start_open(self):
+        """Run one open on its own thread; `_collect` picks the result up later."""
+        self.opening = True
+        self.abandoned = False
+        log.debug("audio input opening")
+        threading.Thread(target=self._run_open, name="audio-open", daemon=True).start()
+
+    def _run_open(self):
+        try:
+            analyzer, error = self.open_fn(self.cfg)
+        except Exception as e:                       # an open_fn that raises must not kill the thread
+            analyzer, error = None, e
+        with self.lock:
+            self.result = (analyzer, error)
+
+    def _collect(self, now):
+        """Take over the result of a finished open thread, if one has delivered."""
+        with self.lock:
+            result, self.result = self.result, None
+        if result is None:
+            return
+        self.opening = False
+        analyzer, error = result
+        if self.abandoned:
+            # the stream stopped being wanted while it was opening: never hand it out
+            self.abandoned = False
+            if analyzer is not None:
+                stop_analyzer(analyzer, self.close_timeout)
+                log.info("audio input closed")
+            return
         if analyzer is not None:
             self.analyzer = analyzer
             self.last_try = None
             self.failed = False
             log.info("audio input opened")
-        elif not self.failed:
+            return
+        self.last_try = now      # the retry cadence runs from the end of the attempt
+        if not self.failed:
             self.failed = True
             log.error("audio input failed (%s). Retrying every %.0f s "
                       "(macOS may still be asking for microphone permission).", error, self.retry_seconds)
@@ -818,8 +903,10 @@ class AudioController:
         analyzer, self.analyzer = self.analyzer, None
         self.last_try = None
         self.failed = False
+        if self.opening:
+            self.abandoned = True
         if analyzer is not None:
-            analyzer.stop()
+            stop_analyzer(analyzer, self.close_timeout)
             log.info("audio input closed")
 
 
@@ -947,6 +1034,150 @@ def should_run(enabled, display_asleep, on_battery, cfg):
     return bool(cfg[key])
 
 
+# ----------------------------------------------------------------------------
+# Background threads: device polling and the watchdog
+# ----------------------------------------------------------------------------
+class DevicePoller(threading.Thread):
+    """Asks the system every `interval` seconds what the device and the power state look like.
+
+    Every one of these questions goes into a macOS framework (CoreMIDI for the port list,
+    CoreGraphics and IOKit for the display and the power source) and any of them can block
+    for a long time while the USB bus re-enumerates. Asking them from the main loop means
+    the whole show freezes whenever that happens, so they are asked here instead: the
+    answers are stored in fields the main loop reads without ever waiting, and a call that
+    blocks only stalls this thread. `last_update` says how fresh the answers are; the
+    watchdog watches it.
+    """
+
+    def __init__(self, present_fn, display_fn, battery_fn, interval=DEVICE_CHECK_SECONDS):
+        threading.Thread.__init__(self, name="device-poll", daemon=True)
+        self.present_fn = present_fn
+        self.display_fn = display_fn
+        self.battery_fn = battery_fn
+        self.interval = float(interval)
+        self.lock = threading.Lock()
+        self.stopped = threading.Event()
+        self._present = False
+        self._display_asleep = False
+        self._on_battery = False
+        self._last_update = time.monotonic()
+
+    def poll_once(self):
+        """One round of questions. Called by `run`, and once by the caller before starting."""
+        present = self._read(self.present_fn, self._present)
+        display_asleep = self._read(self.display_fn, self._display_asleep)
+        on_battery = self._read(self.battery_fn, self._on_battery)
+        with self.lock:
+            self._present = bool(present)
+            self._display_asleep = bool(display_asleep)
+            self._on_battery = bool(on_battery)
+            self._last_update = time.monotonic()
+
+    def _read(self, fn, previous):
+        """A question that raises keeps the previous answer; the show must not stop for it."""
+        try:
+            return fn()
+        except Exception as e:
+            log.debug("device poll failed (%s); keeping the last value", e)
+            return previous
+
+    def run(self):
+        while not self.stopped.is_set():
+            self.poll_once()
+            self.stopped.wait(self.interval)
+
+    def stop(self):
+        self.stopped.set()
+
+    @property
+    def present(self):
+        with self.lock:
+            return self._present
+
+    @property
+    def display_asleep(self):
+        with self.lock:
+            return self._display_asleep
+
+    @property
+    def on_battery(self):
+        with self.lock:
+            return self._on_battery
+
+    @property
+    def last_update(self):
+        with self.lock:
+            return self._last_update
+
+
+def stall_check(now, heartbeat, poll_update, loop_limit=WATCHDOG_SECONDS,
+                poll_limit=POLL_STALL_SECONDS):
+    """Why the show counts as stuck right now, or None while it is healthy.
+
+    `heartbeat` is when the main loop last finished an iteration and `poll_update` when the
+    device poller last finished a round, both on the monotonic clock. Either one falling too
+    far behind `now` means a system call is not coming back, and the only cure is a restart.
+    """
+    behind = now - float(heartbeat)
+    if behind > loop_limit:
+        return "main loop stalled for %.0f s, exiting so launchd restarts the show" % behind
+    behind = now - float(poll_update)
+    if behind > poll_limit:
+        return "device poll stalled for %.0f s, exiting so launchd restarts the show" % behind
+    return None
+
+
+def _exit_stalled():
+    """Leave at once, without unwinding: whatever is stuck would block a clean shutdown too."""
+    logging.shutdown()
+    os._exit(EXIT_STALLED)
+
+
+class Watchdog(threading.Thread):
+    """Ends the process when the main loop or the device poller stops making progress.
+
+    A frozen show cannot fix itself, but launchd's KeepAlive starts it again within seconds
+    of it quitting, so quitting is the repair. Nothing is exited while the clocks stay fresh.
+    """
+
+    def __init__(self, heartbeat_fn, poll_update_fn, interval=WATCHDOG_CHECK_SECONDS,
+                 loop_limit=WATCHDOG_SECONDS, poll_limit=POLL_STALL_SECONDS, on_stall=_exit_stalled):
+        threading.Thread.__init__(self, name="watchdog", daemon=True)
+        self.heartbeat_fn = heartbeat_fn
+        self.poll_update_fn = poll_update_fn
+        self.interval = float(interval)
+        self.loop_limit = float(loop_limit)
+        self.poll_limit = float(poll_limit)
+        self.on_stall = on_stall
+        self.stopped = threading.Event()
+
+    def run(self):
+        while not self.stopped.wait(self.interval):
+            reason = stall_check(time.monotonic(), self.heartbeat_fn(), self.poll_update_fn(),
+                                 self.loop_limit, self.poll_limit)
+            if reason:
+                log.error("%s", reason)
+                self.on_stall()
+                return
+
+    def stop(self):
+        self.stopped.set()
+
+
+class Heartbeat:
+    """The monotonic time of the last main-loop iteration, read by the watchdog thread.
+
+    Storing one float needs no lock: in CPython the assignment and the read are each a
+    single bytecode, so the watchdog always sees either the old value or the new one.
+    """
+
+    def __init__(self):
+        self.value = time.monotonic()
+
+    def beat(self):
+        self.value = time.monotonic()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="X-Touch Mini music-reactive LED show (MC mode)")
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
@@ -963,11 +1194,14 @@ def main(argv=None):
     ap.add_argument("--input", help="override audio_input_device")
     ap.add_argument("--no-audio", action="store_true", help="run without audio (rings stay at 0); for MIDI-only tests")
     ap.add_argument("--duration", type=float, help="quit automatically after this many seconds (for tests)")
+    ap.add_argument("--no-watchdog", action="store_true",
+                    help="do not quit when the show stops making progress (for debugging; "
+                         "normally a stalled show exits so launchd restarts it)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+                        format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
     if args.list_devices:
         list_devices()
@@ -1007,6 +1241,17 @@ def main(argv=None):
     power = PowerState()
     wake = WakeDetector(WAKE_JUMP_SECONDS)
 
+    # the device and the power state are asked for on their own thread: those calls can block
+    # for a long time when the USB bus re-enumerates, and the show must keep running meanwhile
+    poller = DevicePoller(link.still_present, power.display_asleep, power.on_battery)
+    poller.poll_once()       # one synchronous round, so the first iteration already knows
+    poller.start()
+    beat = Heartbeat()
+    watchdog = None
+    if not args.no_watchdog:
+        watchdog = Watchdog(lambda: beat.value, lambda: poller.last_update)
+        watchdog.start()
+
     frame = 1.0 / float(cfg["frame_rate"])
     last_check = 0.0
     last = time.monotonic()
@@ -1034,15 +1279,17 @@ def main(argv=None):
                 last = now
             if now - last_check >= DEVICE_CHECK_SECONDS:
                 last_check = now
-                display_asleep = power.display_asleep()
-                on_battery = power.on_battery()
+                # the poller's latest answers; never a fresh system call from this thread
+                display_asleep = poller.display_asleep
+                on_battery = poller.on_battery
+                present = poller.present
                 if link.connected():
-                    if not link.still_present():
+                    if not present:
                         link.disconnect()
+                elif not present:
+                    log.debug("waiting for MIDI port '%s'", cfg["midi_port_name"])
                 elif link.try_connect():
                     show.on_connected()
-                else:
-                    log.debug("waiting for MIDI port '%s'", cfg["midi_port_name"])
             running = should_run(show.enabled, display_asleep, on_battery, cfg)
             if not show.enabled:
                 suspended = False            # switched off by hand: not a display suspension
@@ -1083,10 +1330,15 @@ def main(argv=None):
             if link.connected() and running:
                 show.tick(now - last, levels, loudness, loudness_rel)
             last = now
+            beat.beat()      # tells the watchdog this iteration finished
             time.sleep(max(0.0, frame - (time.monotonic() - now)))
     except KeyboardInterrupt:
         log.info("stopping")
     finally:
+        # the shutdown below may take its time; it is not a stall
+        if watchdog:
+            watchdog.stop()
+        poller.stop()
         if link.connected():
             with show.lock:
                 show._clear_rings()
