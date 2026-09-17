@@ -160,7 +160,35 @@ echo "[4/6] Building the XTouchShow.app launcher (microphone permission holder)"
 mkdir -p "$DIR/logs"
 BUNDLE_ID="com.castika.xtouchshow.app"
 STAMP_APP="$APP/Contents/Resources/build.stamp"
-RUN_LINE="do shell script \"exec '$DIR/.venv/bin/python' '$DIR/xtouch_show.py' --config '$DIR/config.json' >> '$DIR/logs/xtouch_show.log' 2>&1\""
+# The applet is a stay-open app (osacompile -s): "on run" starts the show in the background
+# and returns at once, so the app's main thread stays free to answer the system. Blocking it
+# in "do shell script" for the lifetime of the show made macOS report it as not responding
+# and burned CPU the whole time. "on idle" then only watches the child.
+# The trailing "&" must stay a plain background job: no nohup, setsid or disown. The launchd
+# job has no AbandonProcessGroup, so launchd stops the show by killing the whole process
+# group, and detaching python from it would leave an orphan behind at every restart.
+APPLET_SRC="property pythonPID : \"\"
+
+on run
+    set pythonPID to do shell script \"'$DIR/.venv/bin/python' '$DIR/xtouch_show.py' --config '$DIR/config.json' >> '$DIR/logs/xtouch_show.log' 2>&1 & echo \$!\"
+end run
+
+on idle
+    try
+        do shell script \"kill -0 \" & pythonPID
+    on error
+        quit
+        return 1
+    end try
+    return 7
+end idle
+
+on quit
+    try
+        do shell script \"kill \" & pythonPID
+    end try
+    continue quit
+end quit"
 # The icon goes into the bundle, so its checksum belongs in the fingerprint:
 # editing or replacing icon.png rebuilds the app with the new icon.
 ICON_SRC="$DIR/icon.png"
@@ -172,7 +200,7 @@ fi
 FINGERPRINT="$DIR
 $MIC_TEXT
 $BUNDLE_ID
-$RUN_LINE
+$APPLET_SRC
 icon:$ICON_SUM"
 if [ -d "$APP" ] && [ -x "$APPLET" ] && [ -f "$STAMP_APP" ] \
    && [ "$(cat "$STAMP_APP")" = "$FINGERPRINT" ]; then
@@ -181,8 +209,8 @@ else
   rm -rf "$APP"
   TMPDIR_APPLET="$(mktemp -d)"
   SRC="$TMPDIR_APPLET/xtouchshow.applescript"
-  printf '%s\n' "$RUN_LINE" > "$SRC"
-  osacompile -o "$APP" "$SRC"
+  printf '%s\n' "$APPLET_SRC" > "$SRC"
+  osacompile -s -o "$APP" "$SRC"
   rm -rf "$TMPDIR_APPLET"
   P="$APP/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :NSMicrophoneUsageDescription '$MIC_TEXT'" "$P" 2>/dev/null \
