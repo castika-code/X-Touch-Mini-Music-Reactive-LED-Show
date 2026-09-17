@@ -1,7 +1,5 @@
 [English](#xtouchshow) | [한국어](#xtouchshow---한국어-가이드) | [日本語](#xtouchshow---日本語ガイド)
 
-<img width="1280" height="640" alt="XTouchShow" src="https://github.com/user-attachments/assets/7b5e6bbb-038e-48aa-adfc-614ae0614aeb" />
-
 ---
 
 # XTouchShow
