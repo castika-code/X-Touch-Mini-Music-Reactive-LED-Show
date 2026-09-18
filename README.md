@@ -237,7 +237,6 @@ If you do not have an external microphone or want to pass the computer's interna
 | `one.display_text` | `"LED ON"` | Text displayed on the 12-character display while the show is on (See 3-7). |
 | `one.display_scroll` | `true` | Whether to scroll the text. If `false`, it is displayed statically, left-aligned. |
 | `one.display_scroll_step_s` | `0.3` | The interval (in seconds) for scrolling the text one step at a time. |
-| --- | --- | --- |
 | `audio_input_device` | `"default"` | The name of the audio input device to use. |
 | `frame_rate` | `30` | LED playback frequency (FPS) per second. |
 | `decay_per_frame` | `1` | The maximum number of steps a bar/ring can fall per frame. |
@@ -845,7 +844,6 @@ DAW で作業中に XTouchShow を実行すると、ショーが開始される�
 | `one.display_text` | `"LED ON"` | ショーが有効な間、12 文字ディスプレイに表示されるテキストです（3-7 参照）。 |
 | `one.display_scroll` | `true` | テキストのスクロール有無です。`false` の場合はスクロールなしで左揃えで固定表示します。 |
 | `one.display_scroll_step_s` | `0.3` | テキストが一文字ずつスクロールする間隔（秒）です。 |
-| --- | --- | --- |
 | `audio_input_device` | `"default"` | 使用するオーディオ入力デバイス名です。 |
 | `frame_rate` | `30` | 1 秒あたりの LED 再生頻度（FPS）です。 |
 | `decay_per_frame` | `1` | 1 フレームあたりにバー/リングが下降できる最大ステップ数です。 |
