@@ -160,32 +160,62 @@ echo "[4/6] Building the XTouchShow.app launcher (microphone permission holder)"
 mkdir -p "$DIR/logs"
 BUNDLE_ID="com.castika.xtouchshow.app"
 STAMP_APP="$APP/Contents/Resources/build.stamp"
-# The applet is a stay-open app (osacompile -s): "on run" starts the show in the background
-# and returns at once, so the app's main thread stays free to answer the system. Blocking it
-# in "do shell script" for the lifetime of the show made macOS report it as not responding
+# The applet is a stay-open app (osacompile -s): "on run" starts the show and returns at
+# once, so the app's main thread stays free to answer the system. Blocking it in
+# "do shell script" for the lifetime of the show made macOS report it as not responding
 # and burned CPU the whole time. "on idle" then only watches the child.
-# The trailing "&" must stay a plain background job: no nohup, setsid or disown. The launchd
-# job has no AbandonProcessGroup, so launchd stops the show by killing the whole process
-# group, and detaching python from it would leave an orphan behind at every restart.
-APPLET_SRC="property pythonPID : \"\"
+# Python is started with NSTask, not with "do shell script ... &". A backgrounded shell job
+# is a grandchild that is orphaned as soon as the shell exits, and macOS then stops crediting
+# the app for it: the microphone shows up as "Python" (the venv interpreter really is
+# .../Python.framework/.../Python.app) instead of XTouchShow. NSTask spawns python from the
+# app itself, so it stays the app's own child and the microphone permission stays on this app.
+# setStartsNewProcessGroup:false is required: NSTask puts the child in a new process group by
+# default, while the launchd job has no AbandonProcessGroup and is stopped by killing the whole
+# process group - a child outside that group would be left behind at every restart.
+# Sharing the group is also why "on quit" kills by PID: NSTask's terminate() signals the child's
+# process group and does nothing when that is its own group.
+# There is no shell in this path, so ">>" cannot redirect: stdout and stderr are handed an
+# NSFileHandle positioned at the end of the log file instead.
+APPLET_SRC="use framework \"Foundation\"
+use scripting additions
+
+property pythonTask : missing value
 
 on run
-    set pythonPID to do shell script \"'$DIR/.venv/bin/python' '$DIR/xtouch_show.py' --config '$DIR/config.json' >> '$DIR/logs/xtouch_show.log' 2>&1 & echo \$!\"
+    set logPath to \"$DIR/logs/xtouch_show.log\"
+    set fm to current application's NSFileManager's defaultManager()
+    if not (fm's fileExistsAtPath:logPath) then
+        fm's createFileAtPath:logPath |contents|:(missing value) attributes:(missing value)
+    end if
+    set logHandle to current application's NSFileHandle's fileHandleForWritingAtPath:logPath
+    logHandle's seekToEndOfFile()
+    set t to current application's NSTask's alloc()'s init()
+    t's setStartsNewProcessGroup:false
+    t's setLaunchPath:\"$DIR/.venv/bin/python\"
+    t's setArguments:{\"$DIR/xtouch_show.py\", \"--config\", \"$DIR/config.json\"}
+    t's setStandardOutput:logHandle
+    t's setStandardError:logHandle
+    t's launchAndReturnError:(missing value)
+    set pythonTask to t
 end run
 
 on idle
-    try
-        do shell script \"kill -0 \" & pythonPID
-    on error
+    if pythonTask is missing value then
         quit
         return 1
-    end try
+    end if
+    if not ((pythonTask's isRunning()) as boolean) then
+        quit
+        return 1
+    end if
     return 7
 end idle
 
 on quit
     try
-        do shell script \"kill \" & pythonPID
+        if (pythonTask's isRunning()) as boolean then
+            do shell script \"kill \" & (pythonTask's processIdentifier() as text)
+        end if
     end try
     continue quit
 end quit"
@@ -278,8 +308,31 @@ if ask_yes_no "      Start the show automatically at login?" y; then
 </dict>
 </plist>
 PL
+  # bootout returns before launchd has finished releasing the old job, and a bootstrap that
+  # arrives during that teardown fails with "Bootstrap failed: 5: Input/output error" - which
+  # on a re-run would leave the show unregistered and stopped. So wait for the old job to be
+  # gone (as soon as it is, not for a fixed time) and retry the bootstrap a few times; a
+  # genuine failure, such as a bad plist, still stops the script with the error launchd gave.
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  WAITED=0
+  while launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && [ "$WAITED" -lt 50 ]; do
+    sleep 0.1
+    WAITED=$((WAITED + 1))
+  done
+  ATTEMPT=1
+  while true; do
+    if BOOTSTRAP_ERROR="$(launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>&1)"; then
+      break
+    fi
+    if [ "$ATTEMPT" -ge 5 ]; then
+      echo "The autostart agent could not be registered:"
+      echo "$BOOTSTRAP_ERROR"
+      echo "Run this script again, or start the show by hand with: bash manual_start.sh"
+      exit 1
+    fi
+    sleep 1
+    ATTEMPT=$((ATTEMPT + 1))
+  done
   echo "      Registered. It starts at every login."
   echo "      On the very first start macOS shows a microphone permission dialog for \"XTouchShow\"."
   echo "      It must be allowed, otherwise the rings stay at zero and the log fills with silence warnings."

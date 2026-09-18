@@ -20,7 +20,8 @@ fills the Bank/Channel/nav-cluster buttons bottom to top with overall relative l
 an encoder ring showing absolute loudness, the device's own level meter also driven by
 overall relative loudness, and a 12-character display that scrolls a configurable
 message. A configurable button (Scrub by default) switches the show on and off, blinking
-in software while it runs. Toggling the show on either controller switches both.
+in software while it runs, and the jog wheel scales sensitivity there the way the Mini's
+fader does. Toggling the show on either controller switches both.
 
 An optional noise gate (off by default) keeps plain room noise from moving the LEDs.
 Every other knob and button keeps its normal function; the show ignores it.
@@ -69,6 +70,7 @@ WAKE_JUMP_SECONDS = 3.0      # wall clock running this far ahead of the monotoni
 DEVICE_CHECK_SECONDS = 2.0   # how often the MIDI port, the display and the power source are polled
 IDLE_LOOP_SECONDS = 2.0      # main-loop pause between iterations while the show is switched off
 AUDIO_CLOSE_TIMEOUT = 3.0    # how long closing the audio stream may take before it is abandoned
+AUDIO_STALL_SECONDS = 5.0    # no audio callback for this long = the stream died without saying so
 WATCHDOG_SECONDS = 15.0      # no main-loop iteration for this long = the loop is stuck
 WATCHDOG_CHECK_SECONDS = 5.0 # how often the watchdog compares the clocks
 POLL_STALL_SECONDS = 30.0    # no finished device poll for this long = the poller is stuck
@@ -123,9 +125,29 @@ ONE_NAV_TIERS = [
 # show) account for all 33. Kept as an empty list, rather than removed, so _clear_rows's
 # loop over it needs no special-casing.
 ONE_UNUSED_NAMES = []
+# The buttons as they physically sit on the device, top row to bottom row and within a row
+# left to right. Only used to let the setup wizard address a button by a two-digit
+# "row + position" code the user can read straight off the hardware. Master occupies row 1
+# slot 2 but has no LED to drive, so it is kept as a None placeholder: it still consumes its
+# position number (Channel Select is 13, not 12) and is simply not selectable.
+ONE_BUTTON_ROWS = [
+    ["BPM", None, "Channel Select", "Channel Mute", "Channel Solo", "Channel Record"],
+    ["F1", "F2", "F3", "F4", "F5", "F6"],
+    ["Marker", "Nudge", "Cycle", "Drop", "Replace", "Click", "Solo"],
+    ["Rewind", "Forward", "Stop", "Play", "Record"],
+    ["Bank Left", "Bank Right", "Scrub"],
+    ["Channel Left", "Channel Right"],
+    ["Up"],
+    ["Left", "Zoom", "Right"],
+    ["Down"],
+]
+ONE_ROW_CODES = {(r + 1) * 10 + (p + 1): name
+                 for r, row in enumerate(ONE_BUTTON_ROWS)
+                 for p, name in enumerate(row) if name is not None}
 RING_CC_ONE = RING_CC_BASE          # CC 48: the One's single V-Pot ring (Fan mode, same scheme as the Mini)
 DISPLAY_CC_BASE = 64                # CC 64..75: the 12-character display, one CC per position
 DISPLAY_CC_TOP = 75
+ONE_SCROLL_GAP = "   "              # blank run between passes of the scrolling display text
 ONE_BLINK_PERIOD_S = 0.5            # software toggle-LED blink half-period (on 0.5s, off 0.5s)
 ONE_PEAK_THRESHOLD = 0.9            # relative loudness above this = a peak
 ONE_PEAK_HOLD_S = 0.25              # minimum time BPM stays lit once a peak is seen
@@ -141,6 +163,13 @@ ONE_METER_MAX = 15                  # meter level range: 0 = off, 15 = full/CLIP
 # off; the two act as a mutually exclusive pair (almost certainly the Mackie Control
 # SMPTE/Beats display-mode toggle).
 ONE_BPM_OFF_NOTE = 113
+# The jog/shuttle wheel is a relative encoder, not an absolute control like the Mini's
+# fader: CC 60 carries one message per detent turned -- value 0x41 clockwise, 0x01
+# counter-clockwise -- and never a position (verified on hardware 2026-09-18).
+ONE_JOG_CC = 60
+ONE_JOG_CW = 0x41
+ONE_JOG_CCW = 0x01
+ONE_SENSITIVITY_STEP = 0.03         # sensitivity change per detent: 34 of them sweep 0.0-1.0
 # note numbers that count as a press of a given LED name; equal to the LED note except
 # for these three, where the device sends a different note on press (see README/spec)
 ONE_PRESS_OVERRIDES = {
@@ -247,6 +276,24 @@ def _resolve_one_led_note(value):
     return None, None
 
 
+def _resolve_one_toggle_answer(value):
+    """(name, note) for a toggle button typed into the setup wizard: an LED name, a
+    two-digit row/position code (see ONE_ROW_CODES) or a literal note number, with the
+    same (None, None) for anything that matches no button.
+
+    A two-digit string is always read as a code, never as a note number: every LED has a
+    code, so the note-number form is only an escape hatch for notes the show does not name.
+    Codes are a typing convenience for the wizard alone - what gets stored is the name/note
+    _resolve_one_led_note would have produced, which is all the rest of the program reads.
+    """
+    if isinstance(value, str):
+        s = value.strip()
+        if len(s) == 2 and s.isascii() and s.isdigit():
+            name = ONE_ROW_CODES.get(int(s))
+            return (name, ONE_LED_NOTES[name]) if name is not None else (None, None)
+    return _resolve_one_led_note(value)
+
+
 def _one_press_notes(led_note):
     """Note number(s) the X-Touch One sends when the button with this LED note is pressed."""
     return ONE_PRESS_OVERRIDES.get(led_note, (led_note,))
@@ -312,7 +359,7 @@ def _finalize_config(cfg):
         log.warning("config: one.toggle_button %r is not valid; using 'Scrub'", raw_toggle)
         name = "Scrub"
     cfg["one"]["toggle_button"] = name if name is not None else note
-    cfg["one"]["display_text"] = str(cfg["one"].get("display_text") or "LED ON").upper()[:12]
+    cfg["one"]["display_text"] = str(cfg["one"].get("display_text") or "LED ON").upper()
     cfg["one"]["display_scroll"] = bool(cfg["one"].get("display_scroll", True))
     try:
         step = float(cfg["one"].get("display_scroll_step_s") or 0.3)
@@ -374,21 +421,31 @@ class ShowState:
             self._enabled = bool(value)
 
     def toggle(self, caller=None):
-        """Flip the flag and, when it went off, clear every registered renderer but `caller`.
+        """Flip the flag and bring every registered renderer but `caller` in line with it.
 
-        `caller` (the renderer whose button was pressed) is skipped because it clears itself
-        inside its own `_toggle()`. The lock is deliberately released before calling into any
-        other renderer: each renderer's `_toggle()` holds its own lock across the call to this
-        method, so reaching for a second renderer's lock while still holding this one would
-        invert the lock order between two device threads and could deadlock.
+        `caller` (the renderer whose button was pressed) is skipped because it updates itself
+        inside its own `_toggle()`. Going off clears the other renderers completely, since a
+        renderer whose `tick()` returns early on the shared OFF flag would otherwise stay
+        frozen at whatever it last drew; going on only syncs their toggle LEDs, the rest of
+        the frame being drawn by their next `tick()`. Both directions have to be pushed from
+        here rather than left to `tick()` to notice the flag changed, because no `tick()` runs
+        at all while the show is suspended (the display is asleep).
+
+        The lock is released before calling into any other renderer, and no renderer holds
+        its own lock across its call to this method: reaching for a second renderer's lock
+        while holding the first would invert the lock order between two device threads and
+        could deadlock, now that both directions call across.
         """
         with self.lock:
             self._enabled = not self._enabled
             new_enabled = self._enabled
-            others = [r for r in self._renderers if r is not caller] if not new_enabled else []
+            others = [r for r in self._renderers if r is not caller]
         self.wake_event.set()
         for r in others:
-            r.full_clear()
+            if new_enabled:
+                r.sync_toggle_led()
+            else:
+                r.full_clear()
         return new_enabled
 
 
@@ -430,9 +487,14 @@ class MiniRenderer:
             self.send_cc(CC_MC_MODE, 1)
             self.last_sent = [-1] * 8
             self.last_button = [-1] * 16
-            self.last_led = None          # the device forgot its LEDs, re-send
             self._clear_rings()
             self._clear_buttons()
+            # the Mini blinks a Layer LED in hardware once told to, with no further messages
+            # from us, so one left blinking by a run with the other `toggle_button` configured
+            # would keep blinking forever: clear both candidates before lighting the current one
+            for layer_note in LAYER_NOTES.values():
+                self.send_note(layer_note, LED_OFF)
+            self.last_led = LED_OFF
             self._set_toggle_led()
             log.info("[mini] device ready | state=%s | toggle=Layer %s (note %d)",
                      self.state, self.cfg["toggle_button"], self.toggle_note)
@@ -465,13 +527,15 @@ class MiniRenderer:
         self.fader_scale = max(0.0, min(1.0, value14 / FADER_MAX))
 
     def _toggle(self):
+        # the flag is flipped outside this renderer's lock: ShowState.toggle() calls into the
+        # other renderers, which take their own locks (see its docstring on the lock order)
+        new_enabled = self._state.toggle(caller=self)
         with self.lock:
-            new_enabled = self._state.toggle(caller=self)
             if not new_enabled:
                 self._clear_rings()
                 self._clear_buttons()
             self._set_toggle_led()
-            log.info("[mini] show %s (Layer %s)", "ON" if new_enabled else "OFF", self.cfg["toggle_button"])
+        log.info("[mini] show %s (Layer %s)", "ON" if new_enabled else "OFF", self.cfg["toggle_button"])
 
     # -- periodic update (called from main loop) ---------------------------
     def tick(self, dt, levels, loudness=0.0, loudness_rel=None,
@@ -543,6 +607,13 @@ class MiniRenderer:
             self.send_note(self.toggle_note, velocity)
             self.last_led = velocity
 
+    def sync_toggle_led(self):
+        """Bring the toggle LED in line with the shared flag straight away, for a toggle on
+        another controller: no `tick()` runs while the show is suspended, so waiting for one
+        would leave this device's LED contradicting the show's actual state indefinitely."""
+        with self.lock:
+            self._set_toggle_led()
+
     @property
     def state(self):
         return "ON" if self.enabled else "OFF"
@@ -582,11 +653,12 @@ class OneRenderer:
     relative-level bar reuses the Bank/Channel/nav-cluster buttons, which sit in one
     vertical column on the device: grouped into 5 tiers (see ONE_NAV_TIERS) and filled
     from the bottom tier upward as overall relative loudness rises, one tier per step
-    instead of one LED per step. There is also one encoder ring (absolute loudness,
-    sensitivity fixed at 1.0: the One has no fader to scale it), the real hardware level
-    meter (driven by overall relative loudness via Channel Pressure, separately from the
-    ring), a 12-character scrolling display, and a software-blinked toggle LED (the
-    device's blink velocity is unverified).
+    instead of one LED per step. There is also one encoder ring (absolute loudness), the
+    real hardware level meter (driven by overall relative loudness via Channel Pressure,
+    separately from the ring), a 12-character scrolling display, and a software-blinked
+    toggle LED (the device's blink velocity is unverified). Every level-driven output above
+    is scaled by `fader_scale`, the sensitivity the jog wheel sets -- the One's equivalent
+    of the Mini's fader.
 
     Pass the same ShowState instance a MiniRenderer uses (via `state`) to have both
     controllers reflect one shared ON/OFF flag; standalone use creates a private one.
@@ -629,7 +701,7 @@ class OneRenderer:
                           for tier in ONE_NAV_TIERS]
         self.unused_notes = [ONE_LED_NOTES[n] for n in ONE_UNUSED_NAMES if n != self.toggle_name]
 
-        self.display_text = str(one_cfg.get("display_text") or "LED ON").upper()[:12]
+        self.display_text = str(one_cfg.get("display_text") or "LED ON").upper()
         self.display_scroll = bool(one_cfg.get("display_scroll", True))
         try:
             step = float(one_cfg.get("display_scroll_step_s") or 0.3)
@@ -637,6 +709,7 @@ class OneRenderer:
             step = 0.3
         self.scroll_step_s = step if step > 0 else 0.3
 
+        self.fader_scale = 1.0
         self.f1_line = 0
         self.marker_line = 0
         self.rewind_line = 0
@@ -672,6 +745,9 @@ class OneRenderer:
     # -- device (re)connect -------------------------------------------------
     def on_connected(self):
         with self.lock:
+            # a relative control leaves nothing to read back after a disconnect, so
+            # sensitivity returns to full rather than keeping a possibly stale value
+            self.fader_scale = 1.0
             self.last_ring = None
             self.last_button = {}
             self.last_display = {}
@@ -712,21 +788,37 @@ class OneRenderer:
 
     # -- input events (called from MIDI thread) ------------------------------
     def on_midi(self, msg):
-        """Only the toggle button belongs to the show; everything else (including the
-        jog wheel's CC 60) is ignored."""
+        """Two controls belong to the show: the toggle button and the jog wheel, which sets
+        the sensitivity the Mini's fader sets there. The rest is ignored."""
         if len(msg) < 3:
             return
         status, d1, d2 = msg[0], msg[1], msg[2]
         kind, ch = status & 0xF0, status & 0x0F
         if kind == 0x90 and ch == MIDI_CH and d2 > 0 and d1 in self.press_notes:
             self._toggle()
+        elif kind == 0xB0 and ch == MIDI_CH and d1 == ONE_JOG_CC:
+            self._on_jog(d2)
+
+    def _on_jog(self, value):
+        # names don't reflect confirmed CW/CCW direction; live testing confirmed
+        # which raw value should increase vs decrease sensitivity
+        if value == ONE_JOG_CW:
+            step = -ONE_SENSITIVITY_STEP
+        elif value == ONE_JOG_CCW:
+            step = ONE_SENSITIVITY_STEP
+        else:
+            return                   # a wheel mode this show doesn't drive
+        self.fader_scale = max(0.0, min(1.0, self.fader_scale + step))
 
     def _toggle(self):
+        # the flag is flipped outside this renderer's lock: ShowState.toggle() calls into the
+        # other renderers, which take their own locks (see its docstring on the lock order)
+        new_enabled = self._state.toggle(caller=self)
         with self.lock:
-            new_enabled = self._state.toggle(caller=self)
             if not new_enabled:
                 self._clear_all()
-            log.info("[one] show %s (%s)", "ON" if new_enabled else "OFF", self.toggle_label)
+            self._set_toggle_led()
+        log.info("[one] show %s (%s)", "ON" if new_enabled else "OFF", self.toggle_label)
 
     # -- periodic update (called from main loop) -----------------------------
     def tick(self, dt, levels, loudness=0.0, loudness_rel=None,
@@ -755,8 +847,8 @@ class OneRenderer:
         one-step-per-frame decay algorithm as the old loudness bars, sized to the row.
         Each of the three inputs is already the SpectrumAnalyzer's own auto-ranging value
         for that band group -- the loudest gain-adjusted sub-band in the group, normalised
-        against its own recent min/max range -- so it is used here as-is, with no further
-        scaling."""
+        against its own recent min/max range -- so it gets no gain of its own here beyond
+        the jog wheel's sensitivity, which _step_bar applies."""
         self.f1_line = self._step_bar(self.f1_line, band_rel_high, len(self.f1_line_notes))
         self.marker_line = self._step_bar(self.marker_line, band_rel_mid, len(self.marker_line_notes))
         self.rewind_line = self._step_bar(self.rewind_line, band_rel_low, len(self.rewind_line_notes))
@@ -790,8 +882,10 @@ class OneRenderer:
 
     def _render_peak(self, dt, loudness_rel):
         """BPM lights as a peak indicator: on immediately at/above the threshold, held on
-        for at least ONE_PEAK_HOLD_S afterward so short peaks stay visible."""
-        if loudness_rel >= ONE_PEAK_THRESHOLD:
+        for at least ONE_PEAK_HOLD_S afterward so short peaks stay visible. The threshold
+        is met by the sensitivity-scaled loudness the bars are drawn from, so turning the
+        jog wheel down makes a peak harder to reach just as it makes the bars shorter."""
+        if loudness_rel * self.fader_scale >= ONE_PEAK_THRESHOLD:
             self.peak_hold_remaining = ONE_PEAK_HOLD_S
             self.peak_on = True
         elif self.peak_hold_remaining > 0:
@@ -805,12 +899,12 @@ class OneRenderer:
     def _step_bar(self, bar, level, size):
         """Next row length in LEDs: rises at once, falls at most decay_per_frame per frame."""
         level = min(1.0, max(0.0, float(level)))
-        target = int(round(level * size))
+        target = int(round(level * self.fader_scale * size))
         return max(target, bar - self.decay) if target < bar else target
 
     def _render_ring(self, loudness):
         level = min(1.0, max(0.0, float(loudness)))
-        target = int(round(level * RING_MAX))
+        target = int(round(level * self.fader_scale * RING_MAX))
         if target < self.ring_current:
             self.ring_current = max(target, self.ring_current - self.decay)
         else:
@@ -821,28 +915,35 @@ class OneRenderer:
         """The real level meter, via Channel Pressure -- separate from the encoder ring
         and from every note-based LED above. Scaled straight from relative loudness with
         no decay of its own: the hardware meter has its own release behavior."""
-        level = min(ONE_METER_MAX, max(0, int(round(min(1.0, max(0.0, float(loudness_rel))) * ONE_METER_MAX))))
+        rel = min(1.0, max(0.0, float(loudness_rel))) * self.fader_scale
+        level = min(ONE_METER_MAX, max(0, int(round(rel * ONE_METER_MAX))))
         self._send_meter(level)
 
     def _render_display(self, dt):
+        """Scrolling on: the 12-character window slides right to left through the text
+        followed by ONE_SCROLL_GAP, wrapping round for ever -- so text of any length keeps
+        moving. Scrolling off: the text sits static at the left, padded out with blanks."""
         text = self.display_text
-        length = len(text)
-        max_offset = max(0, 12 - length) if length else 0
-        if self.display_scroll and max_offset > 0:
-            self.scroll_accum += dt
-            if self.scroll_accum >= self.scroll_step_s:
-                steps = int(self.scroll_accum // self.scroll_step_s)
-                self.scroll_accum -= steps * self.scroll_step_s
-                self.scroll_offset = (self.scroll_offset + steps) % (max_offset + 1)
-        else:
+        if not self.display_scroll:
             self.scroll_offset = 0
-        self._draw_display(text, self.scroll_offset)
+            self._draw_display(text, 0)
+            return
+        loop_text = text + ONE_SCROLL_GAP
+        self.scroll_accum += dt
+        if self.scroll_accum >= self.scroll_step_s:
+            steps = int(self.scroll_accum // self.scroll_step_s)
+            self.scroll_accum -= steps * self.scroll_step_s
+            self.scroll_offset = (self.scroll_offset + steps) % max(1, len(loop_text))
+        self._draw_display(loop_text, self.scroll_offset, loop=True)
 
-    def _draw_display(self, text, offset):
+    def _draw_display(self, text, offset, loop=False):
         length = len(text)
         for position in range(1, 13):
-            idx = position - 1 - offset
-            ch = text[idx] if 0 <= idx < length else " "
+            if loop:
+                ch = text[(offset + position - 1) % length] if length else " "
+            else:
+                idx = position - 1 - offset
+                ch = text[idx] if 0 <= idx < length else " "
             self._send_display(position, _one_char_code(ch))
 
     def _render_blink(self, dt):
@@ -882,6 +983,20 @@ class OneRenderer:
         if velocity != self.last_toggle_led:
             self.send_note(self.toggle_note, velocity)
             self.last_toggle_led = velocity
+
+    def _set_toggle_led(self):
+        """OFF -> dark, ON -> lit with the software blink restarted from lit, so an ON that
+        arrives while the show is suspended (no `tick()`, so no blinking) still leaves the
+        LED in the solid-on state suspension uses, and blinks on from there once ticks run."""
+        self.blink_on = self.enabled
+        self.blink_accum = 0.0
+        self._send_toggle_led(LED_ON if self.blink_on else LED_OFF)
+
+    def sync_toggle_led(self):
+        """Bring the toggle LED in line with the shared flag straight away, for a toggle on
+        another controller; see MiniRenderer.sync_toggle_led()."""
+        with self.lock:
+            self._set_toggle_led()
 
     def _set_bpm(self, on):
         """BPM (note 114) is not a normal LED: velocity 0 / Note Off never clears it, so
@@ -987,6 +1102,7 @@ class SpectrumAnalyzer:
         self.gate_open = self.noise_gate_db is None
         self.lock = threading.Lock()
         self.stream = None
+        self.last_callback = time.monotonic()    # liveness; see get_callback_age()
         self.block_s = AUDIO_BLOCKSIZE / float(self.samplerate)   # one callback block, in seconds
         # rolling min/max envelopes of the loudness -> relative bar, and of each of the
         # three frequency-band groups -> the X-Touch One's auto-ranging rows. All four
@@ -1040,6 +1156,8 @@ class SpectrumAnalyzer:
         self.win_gain = self.window.sum() / 2.0     # full-scale sine -> ~0 dB
 
     def _callback(self, indata, frames, time_info, status):
+        with self.lock:
+            self.last_callback = time.monotonic()
         mono = indata[:, 0] if indata.ndim > 1 else indata
         if indata.ndim > 1 and indata.shape[1] > 1:
             mono = indata.mean(axis=1)
@@ -1117,6 +1235,9 @@ class SpectrumAnalyzer:
         self.stream = self.sd.InputStream(device=self.device_index, channels=1, samplerate=self.samplerate,
                                           blocksize=AUDIO_BLOCKSIZE, dtype="float32", callback=self._callback)
         self.stream.start()
+        # the liveness grace period runs from here, not from the constructor: the open above
+        # can sit inside CoreAudio for half a minute while macOS re-checks the permission
+        self.last_callback = time.monotonic()
         log.info("audio input: '%s' @ %d Hz, fft %d", self.device_name, self.samplerate, self.n)
 
     def stop(self):
@@ -1162,6 +1283,14 @@ class SpectrumAnalyzer:
     def get_gate_open(self):
         with self.lock:
             return bool(self.gate_open)
+
+    def get_callback_age(self):
+        """Seconds since the audio callback last ran. Blocks arrive every `block_s` seconds
+        whatever the room does - silence still calls back - so a large age means the stream
+        itself is dead, not that it is quiet. Read against the analyzer's own clock so the
+        caller needs no timebase of its own."""
+        with self.lock:
+            return time.monotonic() - self.last_callback
 
     def get_gate_status(self):
         """'off' when no gate is configured, otherwise the current open/closed state."""
@@ -1606,6 +1735,30 @@ def _ask_text(ask, prompt, default):
     return answer if answer else default
 
 
+def _one_row_code_lines(width=75):
+    """The X-Touch One's buttons as one line per physical row, each as 'Name(code)'.
+
+    Built from ONE_BUTTON_ROWS itself, so the names and codes the wizard prints cannot
+    drift from the ones it accepts. A row wider than `width` continues on a further line
+    indented under its first button rather than being split mid-name.
+    """
+    lines = []
+    for r, row in enumerate(ONE_BUTTON_ROWS):
+        label = "Row %d:" % (r + 1)
+        line = label
+        for p, name in enumerate(row):
+            if name is None:
+                continue
+            piece = "%s(%d)" % (name, (r + 1) * 10 + p + 1)
+            if len(line) + 1 + len(piece) > width:
+                lines.append(line)
+                line = " " * len(label) + " " + piece
+            else:
+                line += " " + piece
+        lines.append(line)
+    return lines
+
+
 def _config_for_write(cfg):
     """The new-structure view of `cfg` that the wizard writes: shared top-level settings
     plus the 'mini' and 'one' sections, without the legacy flat per-device keys."""
@@ -1646,15 +1799,19 @@ def run_setup(config_path, ask=input, midi_ports=None, audio_devices=None, noise
     proxy_names = [str(cfg["mini"]["daw_proxy_name"] or "").strip(), str(cfg["one"]["daw_proxy_name"] or "").strip()]
     proxy_notes = dict.fromkeys([n for n in proxy_names if n], PROXY_PORT_NOTE)
 
-    print("1) X-Touch Mini MIDI output port [mini.midi_port_name]")
-    _print_list(midi_ports, proxy_notes)
-    default_port = _first_match(midi_ports, "X-TOUCH MINI", exclude=proxy_names) \
-        or cfg["mini"]["midi_port_name"]
-    if str(default_port).strip().lower() in {n.lower() for n in proxy_names}:
-        default_port = DEFAULT_MINI["midi_port_name"]
-    cfg["mini"]["midi_port_name"] = _ask_name(ask, "   Number or port name", midi_ports, default_port)
+    print("1) Enable the X-Touch Mini? [mini.enabled]")
+    mini_default_port = _first_match(midi_ports, "X-TOUCH MINI", exclude=proxy_names)
+    cfg["mini"]["enabled"] = _ask_yes_no(ask, "   y/n", bool(mini_default_port))
 
-    print("\n2) Audio input device [audio_input_device]")
+    if cfg["mini"]["enabled"]:
+        print("\n2) X-Touch Mini MIDI output port [mini.midi_port_name]")
+        _print_list(midi_ports, proxy_notes)
+        default_port = mini_default_port or cfg["mini"]["midi_port_name"]
+        if str(default_port).strip().lower() in {n.lower() for n in proxy_names}:
+            default_port = DEFAULT_MINI["midi_port_name"]
+        cfg["mini"]["midi_port_name"] = _ask_name(ask, "   Number or port name", midi_ports, default_port)
+
+    print("\n3) Audio input device [audio_input_device]")
     print("   Pick the microphone that will hear the music (choose BlackHole 2ch if you installed it)")
     default_input = None
     if audio_devices is None:
@@ -1663,11 +1820,9 @@ def run_setup(config_path, ask=input, midi_ports=None, audio_devices=None, noise
     default_dev = default_input or cfg["audio_input_device"]
     cfg["audio_input_device"] = _ask_name(ask, "   Number or device name", audio_devices, default_dev)
 
-    print("\n3) Button that switches the Mini's show on and off [mini.toggle_button]: Layer A or B")
-    cfg["mini"]["toggle_button"] = _ask_choice(ask, "   A/B", ("A", "B"), cfg["mini"]["toggle_button"])
-
-    print("\n4) Use the Mini's two button-LED loudness bars? [mini.buttons_enabled]")
-    cfg["mini"]["buttons_enabled"] = _ask_yes_no(ask, "   y/n", bool(cfg["mini"]["buttons_enabled"]))
+    if cfg["mini"]["enabled"]:
+        print("\n4) Button that switches the Mini's show on and off [mini.toggle_button]: Layer A or B")
+        cfg["mini"]["toggle_button"] = _ask_choice(ask, "   A/B", ("A", "B"), cfg["mini"]["toggle_button"])
 
     print("\n5) Noise gate [noise_gate_db] (shared by both controllers)")
     print("   The noise gate is off by default. Enable it only if room noise alone moves the")
@@ -1700,20 +1855,26 @@ def run_setup(config_path, ask=input, midi_ports=None, audio_devices=None, noise
         cfg["one"]["midi_port_name"] = _ask_name(ask, "   Number or port name", midi_ports, default_one_port)
 
         print("\n9) X-Touch One toggle button [one.toggle_button]")
-        print("   Any of the 33 LED names (BPM, F1-F6, Marker, Play, Scrub, ...) or a MIDI note number.")
-        raw_toggle = _ask_text(ask, "   Button name or note number", cfg["one"]["toggle_button"])
-        name, note = _resolve_one_led_note(raw_toggle)
+        print("   All %d buttons, laid out as they sit on the device. Pick one by its code in" % len(ONE_LED_NOTES))
+        print("   brackets (row number, then position from the left) or by its name:")
+        for line in _one_row_code_lines():
+            print("   " + line)
+        print("   Master sits at 12 but has no LED the show can drive, so it has no code. A")
+        print("   two-digit answer is always read as a code; a MIDI note number is also")
+        print("   accepted, for a note none of these names covers.")
+        raw_toggle = _ask_text(ask, "   Button name, code or note number", cfg["one"]["toggle_button"])
+        name, note = _resolve_one_toggle_answer(raw_toggle)
         if note is None:
             print("  '%s' is not a valid button; keeping '%s'." % (raw_toggle, cfg["one"]["toggle_button"]))
         else:
             cfg["one"]["toggle_button"] = name if name is not None else note
 
         print("\n10) X-Touch One display text [one.display_text]")
-        print("   Up to 12 characters, shown in capitals; scrolls automatically if longer than")
-        print("   fits. Note: on this display W renders like U, and M, K, X are unreadable or")
-        print("   ambiguous, so avoid them if you can.")
+        print("   Shown in capitals on the 12-character display; scrolls right to left on a loop while")
+        print("   scrolling is on. Note: on this display W renders like U, and M, K, X are")
+        print("   unreadable or ambiguous, so avoid them if you can.")
         text = _ask_text(ask, "   Text", cfg["one"]["display_text"])
-        cfg["one"]["display_text"] = str(text).upper()[:12]
+        cfg["one"]["display_text"] = str(text).upper()
 
     _write_config(config_path, _config_for_write(cfg))
     print("\nSettings saved: %s" % config_path)
@@ -1822,7 +1983,8 @@ class AudioController:
     returns the analyzer to read from (None while the stream is closed). `wanted` is
     the caller's decision - in the show that is "MIDI device connected and show ON".
     A failed open is retried every `retry_seconds`, but only while the stream is still
-    wanted, so an unplugged device or a show that is off costs no attempts at all.
+    wanted, so an unplugged device or a show that is off costs no attempts at all. A stream
+    that is open but has stopped calling back is dropped and reopened too (see `_check_stall`).
 
     Opening runs on a daemon thread and `update` never waits for it: the first open after
     the app bundle was rebuilt can sit inside CoreAudio for half a minute while macOS
@@ -1832,11 +1994,12 @@ class AudioController:
     """
 
     def __init__(self, cfg, open_fn=None, retry_seconds=AUDIO_RETRY_SECONDS,
-                 close_timeout=AUDIO_CLOSE_TIMEOUT):
+                 close_timeout=AUDIO_CLOSE_TIMEOUT, stall_seconds=AUDIO_STALL_SECONDS):
         self.cfg = cfg
         self.open_fn = open_fn if open_fn is not None else open_audio
         self.retry_seconds = float(retry_seconds)
         self.close_timeout = float(close_timeout)
+        self.stall_seconds = float(stall_seconds)
         self.analyzer = None
         self.last_try = None     # when the last open finished failing; None = try at once
         self.failed = False      # a failure streak is running; its error was already reported
@@ -1850,10 +2013,28 @@ class AudioController:
         if not wanted:
             self.close()
             return None
+        self._check_stall()
         if self.analyzer is None and not self.opening and (
                 self.last_try is None or now - self.last_try >= self.retry_seconds):
             self._start_open()
         return self.analyzer
+
+    def _check_stall(self):
+        """Drop a stream that opened cleanly but stopped calling back.
+
+        CoreAudio can hand back a stream that reports success - no error, microphone
+        indicator lit - while the callback behind it is dead, which used to leave the show
+        running but deaf until somebody restarted it by hand. Dropping the analyzer puts
+        `update` back in its "nothing open yet" state, so the normal open path builds a
+        fresh stream on this same call.
+        """
+        if self.analyzer is None:
+            return
+        age = self.analyzer.get_callback_age()
+        if age < self.stall_seconds:
+            return
+        log.warning("audio callback stalled for %.1f s; reopening", age)
+        self.close()
 
     def _start_open(self):
         """Run one open on its own thread; `_collect` picks the result up later."""

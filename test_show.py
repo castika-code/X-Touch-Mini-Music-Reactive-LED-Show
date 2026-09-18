@@ -329,11 +329,13 @@ SAMPLES = [-60, -58, -59, -57, -20, -58]
 def wizard(path, answers, noise_samples=None, midi_ports=None):
     """Run run_setup with canned answers; returns (exit code, written config, printed text).
 
-    Question order: Mini MIDI port, audio input, Mini toggle button, Mini button bars,
-    measure the noise gate (defaults to n: the gate stays off / keeps whatever the file
-    already has), enable the X-Touch One, and - only if that answer is yes - whether it's
-    set to MC mode (no, or the default, forces it back off and skips the rest), then -
-    only if MC mode is confirmed - the One's MIDI port, toggle button and display text.
+    Question order: enable the X-Touch Mini, and - only if that answer is yes - its MIDI
+    port; then audio input; then - again only if the Mini is enabled - its toggle button;
+    then measure the noise gate (defaults to n: the gate stays off /
+    keeps whatever the file already has), enable the X-Touch One, and - only if that
+    answer is yes - whether it's set to MC mode (no, or the default, forces it back off
+    and skips the rest), then - only if MC mode is confirmed - the One's MIDI port,
+    toggle button and display text.
     """
     it = iter(answers)
     out = io.StringIO()
@@ -349,15 +351,20 @@ NEW_CONFIG_KEYS = set(x.DEFAULT_CONFIG) - set(x.LEGACY_MINI_KEYS)   # shared key
 tmp = tempfile.mkdtemp()
 path = os.path.join(tmp, "config.json")
 
-# 25. answers are written in the new mini/one structure; Enter keeps the preselected
-#     X-TOUCH MINI port; the One is not in PORTS, so its default is 'no' and it is skipped.
+# 25. answers are written in the new mini/one structure; the Mini is in PORTS, so its enable
+#     question defaults to 'yes' and Enter keeps both it and the preselected X-TOUCH MINI
+#     port; the One is not in PORTS, so its default is 'no' and it is skipped.
 #     Enter on the noise question = n: no measurement, so the gate stays off.
-code, written, printed = wizard(path, ["", "3", "B", "n", "", "n"])
+code, written, printed = wizard(path, ["", "", "3", "B", "", "n"])
 assert code == 0, code
 assert set(written) == NEW_CONFIG_KEYS, set(written) ^ NEW_CONFIG_KEYS
+assert written["mini"]["enabled"] is True, written
 assert written["mini"]["midi_port_name"] == "X-TOUCH MINI", written
 assert written["audio_input_device"] == "Studio Display Microphone", written
-assert written["mini"]["toggle_button"] == "B" and written["mini"]["buttons_enabled"] is False
+assert written["mini"]["toggle_button"] == "B", written
+#     the button bars are never asked about, so they keep the default
+assert written["mini"]["buttons_enabled"] == x.DEFAULT_MINI["buttons_enabled"], written
+assert "button-LED loudness bars" not in printed, printed
 assert written["noise_gate_db"] is None, written        # default answer -> gate off
 assert "leaves the gate off" in printed, printed
 assert written["one"]["enabled"] is False, written
@@ -368,12 +375,12 @@ loaded = x.load_config(path)
 assert loaded["toggle_button"] == "B" and loaded["mini"]["toggle_button"] == "B"   # legacy keys mirror 'mini'
 
 # 26. saying yes to the measurement stores room noise + noise_gate_margin_db (= enables the gate)
-code, gated, printed = wizard(path, ["", "3", "B", "n", "y", "n"], noise_samples=SAMPLES)
+code, gated, printed = wizard(path, ["", "", "3", "B", "y", "n"], noise_samples=SAMPLES)
 assert code == 0 and gated["noise_gate_db"] == -54.0, gated["noise_gate_db"]
 assert set(gated) == NEW_CONFIG_KEYS
 
 # 27. yes without an audio input available: the measurement is skipped and the value kept
-code, kept, printed = wizard(path, ["", "3", "B", "n", "y", "n"])
+code, kept, printed = wizard(path, ["", "", "3", "B", "y", "n"])
 assert code == 0 and kept["noise_gate_db"] == -54.0, kept["noise_gate_db"]
 assert "Skipped" in printed, printed
 
@@ -383,7 +390,8 @@ assert "Skipped" in printed, printed
 #     still 'no' (its port presence, not the stored value, drives the default).
 code, again, printed = wizard(path, ["", "", "", "", "", ""])
 assert code == 0 and set(again) == NEW_CONFIG_KEYS
-assert again["mini"]["toggle_button"] == "B" and again["mini"]["buttons_enabled"] is False
+assert again["mini"]["toggle_button"] == "B", again
+assert again["mini"]["buttons_enabled"] == written["mini"]["buttons_enabled"], again   # never asked
 assert again["mini"]["midi_port_name"] == "X-TOUCH MINI", again
 assert again["audio_input_device"] == "Studio Display Microphone", again
 assert again["noise_gate_db"] == -54.0, again
@@ -392,16 +400,21 @@ assert again["one"]["enabled"] is False
 
 # 29. an out-of-range number is rejected and asked again; a typed name is taken as is;
 #     saying yes to the One asks its three questions
-code, typed, _ = wizard(path, ["9", "My Port", "My USB Mic", "A", "y", "n", "y", "y",
+code, typed, _ = wizard(path, ["y", "9", "My Port", "My USB Mic", "A", "n", "y", "y",
                                "My One Port", "F2", "hi there!!"])
 assert code == 0 and typed["mini"]["midi_port_name"] == "My Port", typed
 assert typed["audio_input_device"] == "My USB Mic" and typed["mini"]["toggle_button"] == "A"
-assert typed["mini"]["buttons_enabled"] is True
+assert typed["mini"]["buttons_enabled"] == again["mini"]["buttons_enabled"], typed   # never asked
 assert typed["noise_gate_db"] == -54.0, typed        # n -> the existing gate is left alone
 assert typed["one"]["enabled"] is True
 assert typed["one"]["midi_port_name"] == "My One Port"
 assert typed["one"]["toggle_button"] == "F2"
 assert typed["one"]["display_text"] == "HI THERE!!"
+
+# 29b. a display text longer than the 12-character window is kept in full, just upper-cased
+code, long_text, _ = wizard(path, ["y", "9", "My Port", "My USB Mic", "A", "n", "y", "y",
+                                   "My One Port", "F2", "show must go on"])
+assert code == 0 and long_text["one"]["display_text"] == "SHOW MUST GO ON", long_text["one"]
 
 # 30. with no config file the audio default is "default" = the system default input and the
 #     gate is off; an invalid typed toggle button keeps the previous value with a message
@@ -413,6 +426,29 @@ assert fresh["noise_gate_db"] is None and x.DEFAULT_CONFIG["noise_gate_db"] is N
 assert fresh["one"]["enabled"] is True
 assert fresh["one"]["toggle_button"] == "Scrub", fresh          # invalid input -> kept as-is
 assert "is not a valid button" in printed, printed
+#     the prompt spells out all 33 names with their row codes, generated from ONE_BUTTON_ROWS
+#     so it cannot go stale when a button is renamed, and laid out one line per physical row
+row_lines = x._one_row_code_lines()
+assert all("   " + line + "\n" in printed for line in row_lines), printed
+assert all(len(line) <= 75 for line in row_lines), row_lines
+assert row_lines[0].startswith("Row 1: BPM(11) Channel Select(13)"), row_lines
+assert "Row 9: Down(91)" in row_lines, row_lines
+listed = " ".join(row_lines)
+assert all("%s(%d)" % (n, c) in listed for c, n in x.ONE_ROW_CODES.items()), listed
+assert "Master" not in listed and "(12)" not in listed, listed   # Master's slot has no code
+assert "Master sits at 12" in printed, printed
+
+# 30b. a row code entered at that question is stored as the button name it resolves to, never
+#      as the code itself; an unassigned code is rejected like any other invalid answer
+code, by_code, printed = wizard(path, ["", "", "", "", "", "y", "y", "", "53", ""])
+assert code == 0 and by_code["one"]["toggle_button"] == "Scrub", by_code["one"]
+code, by_code2, _ = wizard(path, ["", "", "", "", "", "y", "y", "", "16", ""])
+assert code == 0 and by_code2["one"]["toggle_button"] == "Channel Record", by_code2["one"]
+assert x.load_config(path)["one"]["toggle_button"] == "Channel Record"
+for bad in ("12", "18"):
+    code, rejected, printed = wizard(path, ["", "", "", "", "", "y", "y", "", bad, ""])
+    assert code == 0 and rejected["one"]["toggle_button"] == "Channel Record", (bad, rejected["one"])
+    assert "'%s' is not a valid button" % bad in printed, printed
 
 # 31. the suggestion skips the program's own virtual device and prefers the exact name
 assert x._first_match(["X-TOUCH MINI SHOW", "X-TOUCH MINI"], "X-TOUCH MINI",
@@ -431,17 +467,18 @@ assert "X-TOUCH MINI SHOW (this program's virtual device, do not choose)" in pri
 assert "[2] X-TOUCH MINI\n" in printed, printed        # the real one carries no remark
 
 # 33. only the virtual device present, and a stored name that is the virtual device: it is
-#     never offered back as the default
-code, none_left, printed = wizard(path, ["", "", "", "", "", "n"], midi_ports=["X-TOUCH MINI SHOW"])
+#     never offered back as the default. The proxy is not a detected Mini, so the enable
+#     question defaults to n here and has to be answered y to reach the port question.
+code, none_left, printed = wizard(path, ["y", "", "", "", "", "n"], midi_ports=["X-TOUCH MINI SHOW"])
 assert code == 0 and none_left["mini"]["midi_port_name"] == "X-TOUCH MINI", none_left
 with open(path, "w", encoding="utf-8") as f:
     json.dump({"midi_port_name": "X-TOUCH MINI SHOW"}, f)     # old-format flat key
-code, repaired, _ = wizard(path, ["", "", "", "", "", "n"], midi_ports=["X-TOUCH MINI SHOW"])
+code, repaired, _ = wizard(path, ["y", "", "", "", "", "n"], midi_ports=["X-TOUCH MINI SHOW"])
 assert code == 0 and repaired["mini"]["midi_port_name"] == "X-TOUCH MINI", repaired
 
 # 33b. the X-Touch One's own virtual device and proxy name are excluded the same way
 os.remove(path)
-code, one_picked, printed = wizard(path, ["", "", "", "", "", "y", "y", "", "", ""],
+code, one_picked, printed = wizard(path, ["y", "", "", "", "", "y", "y", "", "", ""],
                                    midi_ports=["X-TOUCH ONE SHOW", "X-Touch One"])
 assert code == 0 and one_picked["one"]["midi_port_name"] == "X-Touch One", one_picked
 assert "X-TOUCH ONE SHOW (this program's virtual device, do not choose)" in printed, printed
@@ -456,6 +493,32 @@ assert code == 0 and mc_no["one"]["enabled"] is False, mc_no
 code, mc_yes, printed = wizard(path, ["", "", "", "", "", "y", "y", "", "", ""])
 assert code == 0 and mc_yes["one"]["enabled"] is True, mc_yes
 
+# 33e. saying no to the Mini skips its port and toggle-button questions: the three answers
+#      that follow are taken by the audio, noise and One questions, so a Mini question
+#      wrongly asked here would swallow one and run the answers out
+os.remove(path)
+code, no_mini, printed = wizard(path, ["n", "2", "n", "n"])
+assert code == 0 and no_mini["mini"]["enabled"] is False, no_mini
+assert no_mini["audio_input_device"] == "USB Audio CODEC", no_mini
+assert "X-Touch Mini MIDI output port" not in printed, printed
+assert no_mini["mini"]["toggle_button"] == x.DEFAULT_MINI["toggle_button"], no_mini
+assert no_mini["mini"]["buttons_enabled"] == x.DEFAULT_MINI["buttons_enabled"], no_mini
+assert x.DEFAULT_MINI["enabled"] is True        # only the wizard answer turns the Mini off
+
+# 33f. the enable default follows the ports, not the stored value: with no Mini port present
+#      Enter alone skips the two questions, and the next run - same file, Mini back in the
+#      list - defaults to yes and asks them again
+code, absent, printed = wizard(path, ["", "1", "n", "n"], midi_ports=["X-Touch One"])
+assert code == 0 and absent["mini"]["enabled"] is False, absent
+assert absent["audio_input_device"] == "MacBook Pro Microphone", absent
+assert "X-Touch Mini MIDI output port" not in printed, printed
+code, present, printed = wizard(path, ["", "", "", "", "", "n"])
+assert code == 0 and present["mini"]["enabled"] is True, present
+assert "X-Touch Mini MIDI output port" in printed, printed
+assert present["mini"]["midi_port_name"] == "X-TOUCH MINI", present
+assert present["mini"]["toggle_button"] == "A", present
+assert present["mini"]["buttons_enabled"] == x.DEFAULT_MINI["buttons_enabled"], present
+
 os.remove(path); os.rmdir(tmp)
 
 # ---------------------------------------------------------------------------
@@ -463,8 +526,9 @@ os.remove(path); os.rmdir(tmp)
 # (device connected AND show ON), so the microphone indicator goes off otherwise
 # ---------------------------------------------------------------------------
 class FakeAnalyzer:
-    def __init__(self): self.stops = 0
+    def __init__(self): self.stops = 0; self.age = 0.0
     def stop(self): self.stops += 1
+    def get_callback_age(self): return self.age   # the tests raise `age` to fake a dead callback
 
 import threading as _threading, time as _time
 
@@ -578,6 +642,58 @@ for t in (5.0, 10.0, 60.0):
 assert op.calls == 1
 
 x.log.setLevel(logging.NOTSET)
+
+# ---------------------------------------------------------------------------
+# a stream that opens cleanly but stops calling back is reopened on its own
+# ---------------------------------------------------------------------------
+
+# 40a. an analyzer whose callback keeps firing is never treated as stalled
+op = FakeOpen(); ac = controller(op)
+assert ac.update(0.0, True) is None
+assert delivered(ac)
+a = ac.update(0.1, True)
+a.age = 2 * (x.AUDIO_BLOCKSIZE / float(SR))     # two normal callback intervals of jitter
+for t in (1.0, 60.0, 3600.0):
+    assert ac.update(t, True) is a
+assert op.calls == 1 and a.stops == 0
+
+# 40b. the threshold keeps real margin: an age just short of it is still healthy
+assert x.AUDIO_STALL_SECONDS >= 20 * (x.AUDIO_BLOCKSIZE / float(SR))
+a.age = x.AUDIO_STALL_SECONDS - 0.5
+assert ac.update(3601.0, True) is a and op.calls == 1 and a.stops == 0
+
+x.log.setLevel(logging.CRITICAL)   # 40c logs the expected stall warning
+
+# 40c. the callback stops firing: the dead analyzer is stopped and dropped, and the normal
+#      open path starts a fresh stream at once - no manual restart
+a.age = x.AUDIO_STALL_SECONDS
+assert ac.update(3602.0, True) is None
+assert a.stops == 1 and ac.analyzer is None and ac.opening is True
+assert delivered(ac)
+b = ac.update(3602.1, True)
+assert b is op.made[1] and b is not a and op.calls == 2
+
+# 40d. a stalled analyzer that stops being wanted is closed by the normal path only: the
+#      stall check never runs without an analyzer, so it cannot force an unwanted open
+op = FakeOpen(); ac = controller(op)
+assert ac.update(0.0, True) is None
+assert delivered(ac)
+c = ac.update(0.1, True)
+c.age = 99.0
+assert ac.update(0.2, False) is None
+assert c.stops == 1 and ac.analyzer is None and ac.opening is False
+for t in (5.0, 60.0):
+    assert ac.update(t, False) is None
+assert op.calls == 1
+
+x.log.setLevel(logging.NOTSET)
+
+# 40e. the analyzer's own age is reset by every callback, silence included
+sa = analyzer()
+sa.last_callback = _time.monotonic() - 30.0
+assert sa.get_callback_age() > 29.0
+feed(sa, 0.0, 440.0, 1)            # a block of pure digital silence still calls back
+assert sa.get_callback_age() < 1.0
 
 # ---------------------------------------------------------------------------
 # sleep/wake and the display/power settings
@@ -967,6 +1083,10 @@ assert loaded2["one"]["enabled"] is False
 assert loaded2["one"]["toggle_button"] == "BPM"                # case-insensitive, canonicalized
 assert loaded2["one"]["display_text"] == "HI THERE!!"
 
+# 70b. a display text longer than the 12-character window survives loading uncut
+loaded3 = load_raw({"one": {"display_text": "show must go on"}})
+assert loaded3["one"]["display_text"] == "SHOW MUST GO ON", loaded3["one"]["display_text"]
+
 # 71. an invalid one.toggle_button falls back to 'Scrub' (with a warning)
 x.log.setLevel(logging.CRITICAL)
 bad_toggle = load_raw({"one": {"toggle_button": "Not A Button"}})
@@ -983,6 +1103,49 @@ assert x._resolve_one_led_note("74") == ("F1", 74)             # a bare note num
 assert x._resolve_one_led_note(72) == (None, 72)                # a valid note with no name
 assert x._resolve_one_led_note("nonsense") == (None, None)
 assert x._resolve_one_led_note(200) == (None, None)             # out of MIDI range
+
+# 72b. the physical row layout the wizard's codes are built from covers every LED exactly
+#      once and nothing else: a rename in ONE_LED_NOTES that missed ONE_BUTTON_ROWS (or the
+#      other way round) fails here instead of printing a code that resolves to nothing
+row_names = [n for row in x.ONE_BUTTON_ROWS for n in row if n is not None]
+assert len(row_names) == len(set(row_names)) == len(x.ONE_LED_NOTES), row_names
+assert set(row_names) == set(x.ONE_LED_NOTES), set(row_names) ^ set(x.ONE_LED_NOTES)
+assert x.ONE_BUTTON_ROWS[0][1] is None                      # Master: its slot counts, it is not selectable
+assert [n for row in x.ONE_BUTTON_ROWS for n in row].count(None) == 1, x.ONE_BUTTON_ROWS
+assert len(x.ONE_BUTTON_ROWS) == 9, x.ONE_BUTTON_ROWS
+assert len(x.ONE_ROW_CODES) == len(x.ONE_LED_NOTES)
+assert all(11 <= c <= 99 and c % 10 != 0 for c in x.ONE_ROW_CODES), x.ONE_ROW_CODES
+assert 12 not in x.ONE_ROW_CODES and 18 not in x.ONE_ROW_CODES
+
+# 72c. _resolve_one_toggle_answer: the wizard also takes a two-digit row+position code
+#      (tens = row from the top, ones = position from the left), at least one per row
+for code, expected in [(11, "BPM"), (13, "Channel Select"), (16, "Channel Record"),
+                       (21, "F1"), (26, "F6"), (31, "Marker"), (37, "Solo"),
+                       (41, "Rewind"), (45, "Record"), (51, "Bank Left"), (53, "Scrub"),
+                       (61, "Channel Left"), (71, "Up"), (81, "Left"), (83, "Right"),
+                       (91, "Down")]:
+    assert x._resolve_one_toggle_answer(str(code)) == (expected, x.ONE_LED_NOTES[expected]), code
+#      row 1's Solo/Rec are the channel-strip buttons, not row 3's Solo / row 4's Record
+assert x._resolve_one_toggle_answer("15") == ("Channel Solo", 8)
+assert x._resolve_one_toggle_answer("37") == ("Solo", 90)
+assert x._resolve_one_toggle_answer("45") == ("Record", 95)
+#      a code with no button behind it is rejected outright rather than falling through to
+#      the note number it looks like: 12 is Master's slot, 18 is past the end of row 1
+assert x._resolve_one_toggle_answer("12") == (None, None)
+assert x._resolve_one_toggle_answer("18") == (None, None)
+assert x._resolve_one_toggle_answer("54") == (None, None)      # row 5 stops at Scrub(53)
+assert x._resolve_one_toggle_answer("10") == (None, None)      # no position 0
+assert x._resolve_one_toggle_answer("99") == (None, None)
+#      names and note numbers still resolve exactly as _resolve_one_led_note does
+assert x._resolve_one_toggle_answer("bpm") == ("BPM", 114)
+assert x._resolve_one_toggle_answer("Bank Left") == ("Bank Left", 46)
+assert x._resolve_one_toggle_answer(101) == ("Scrub", 101)
+assert x._resolve_one_toggle_answer("114") == ("BPM", 114)     # three digits: a note, not a code
+assert x._resolve_one_toggle_answer("8") == ("Channel Solo", 8)
+assert x._resolve_one_toggle_answer(74) == ("F1", 74)          # stored ints stay note numbers
+assert x._resolve_one_toggle_answer("nonsense") == (None, None)
+#      codes are a wizard convenience only: a config file still means note numbers by them
+assert x._resolve_one_led_note("11") == (None, 11)
 
 # ---------------------------------------------------------------------------
 # X-Touch One: OneRenderer (bars, ring, display, software toggle blink)
@@ -1134,10 +1297,10 @@ assert ru.unused_notes == [] and x.ONE_UNUSED_NAMES == []
 ru.clear_output()
 ru.clear_output()   # second call in a row: nothing left to resend either
 
-# 76e. a row is driven as-is by whatever band_rel_* the caller passes -- OneRenderer no
-#      longer applies any gain or sensitivity scaling of its own (that now lives in
-#      SpectrumAnalyzer; see test 24d for "loudest sub-band, not the average" at that level).
-#      Passing 0.9 through fills the row to 0.9, unmodified.
+# 76e. a row is driven as-is by whatever band_rel_* the caller passes -- OneRenderer
+#      applies no gain of its own beyond fader_scale, which is 1.0 here (the per-band gain
+#      now lives in SpectrumAnalyzer; see test 24d for "loudest sub-band, not the average"
+#      at that level). Passing 0.9 through fills the row to 0.9, unmodified.
 one_sent.clear()
 rm = x.OneRenderer(cfg, one_default, one_cc, one_note, one_raw)
 rm.tick(0.03, [0]*8, 0.0, 0.0, band_rel_high=0.9)
@@ -1220,15 +1383,70 @@ expected_codes = {75: 12, 74: 5, 73: 4, 72: 32, 71: 15, 70: 14,
 sent_codes = {c: v for (kind, c, v) in one_sent if kind == "cc" and 64 <= c <= 75}
 assert sent_codes == expected_codes, sent_codes
 
-# 78. marquee: the first character's position advances 1 -> 2 -> ... -> 12, then restarts
-#     at 1, stepping once every display_scroll_step_s seconds
-r8 = x.OneRenderer(cfg, dict(one_default, display_text="X", display_scroll=True,
+# 78. marquee: the 12-character window slides right to left through `text + ONE_SCROLL_GAP`
+#     and wraps round for ever, so even text far shorter than 12 characters keeps moving
+one_sent.clear()
+def one_window(r):
+    """The 12 character codes currently on the display, left to right (CC 75 down to 64)."""
+    return [r.last_display.get(x.DISPLAY_CC_TOP - i) for i in range(12)]
+
+def one_codes(text): return [x._one_char_code(ch) for ch in text]
+
+r8 = x.OneRenderer(cfg, dict(one_default, display_text="ABCDE", display_scroll=True,
                              display_scroll_step_s=0.3), one_cc, one_note, one_raw)
-positions = [r8.scroll_offset + 1]
-for _ in range(12):
-    r8.tick(0.3, [0]*8, 0.0, 0.0)
-    positions.append(r8.scroll_offset + 1)
-assert positions == list(range(1, 13)) + [1], positions
+loop8 = "ABCDE" + x.ONE_SCROLL_GAP
+assert len(loop8) == 8
+windows8 = []
+for _ in range(9):
+    r8.tick(0.3, [0]*8, 0.0, 0.0)          # one scroll step per tick
+    windows8.append(one_window(r8))
+assert len({tuple(w) for w in windows8[:8]}) == 8, windows8   # never static: 8 distinct windows
+assert windows8[0] == one_codes("BCDE   ABCDE"), windows8[0]  # offset 1
+# 8 steps = one full cycle of loop8: offset back to 0, window back to where it started
+assert r8.scroll_offset == 1
+assert windows8[7] == one_codes("ABCDE   ABCD"), windows8[7]
+assert windows8[8] == windows8[0]
+
+# 78b. scrolling off: the window is left-aligned, padded to 12 characters and identical on
+#      every tick -- unchanged by the marquee
+one_sent.clear()
+r8b = x.OneRenderer(cfg, dict(one_default, display_text="ABCDE", display_scroll=False,
+                              display_scroll_step_s=0.3), one_cc, one_note, one_raw)
+static8 = []
+for _ in range(4):
+    r8b.tick(0.3, [0]*8, 0.0, 0.0)
+    static8.append(one_window(r8b))
+assert static8[0] == one_codes("ABCDE       "), static8[0]
+assert all(w == static8[0] for w in static8) and r8b.scroll_offset == 0
+
+# 78c. empty text: the gap alone is what loops, so the display just stays blank -- no
+#      modulo-by-zero
+one_sent.clear()
+r8c = x.OneRenderer(cfg, dict(one_default, display_scroll=True, display_scroll_step_s=0.3),
+                    one_cc, one_note, one_raw)
+r8c.display_text = ""
+for _ in range(5):
+    r8c.tick(0.3, [0]*8, 0.0, 0.0)
+assert one_window(r8c) == one_codes(" " * 12)
+
+# 78d. a full 12-character text scrolls too (it used to sit static, having nowhere to slide)
+one_sent.clear()
+r8d = x.OneRenderer(cfg, dict(one_default, display_text="ABCDEFGHIJKL", display_scroll=True,
+                              display_scroll_step_s=0.3), one_cc, one_note, one_raw)
+r8d.tick(0.3, [0]*8, 0.0, 0.0)
+assert one_window(r8d) == one_codes("BCDEFGHIJKL "), one_window(r8d)
+r8d.tick(0.3, [0]*8, 0.0, 0.0)
+assert one_window(r8d) == one_codes("CDEFGHIJKL  "), one_window(r8d)
+
+# 78e. text longer than the window is loaded whole, so its tail scrolls into view: after 6
+#      steps the display holds characters 7-18, none of which ever fit in the first window
+one_sent.clear()
+r8e = x.OneRenderer(cfg, dict(one_default, display_text="ABCDEFGHIJKLMNOPQR", display_scroll=True,
+                              display_scroll_step_s=0.3), one_cc, one_note, one_raw)
+assert r8e.display_text == "ABCDEFGHIJKLMNOPQR", r8e.display_text
+for _ in range(6):
+    r8e.tick(0.3, [0]*8, 0.0, 0.0)
+assert one_window(r8e) == one_codes("GHIJKLMNOPQR"), one_window(r8e)
 
 # 79. software toggle-LED blink: flips every 0.5 s while ON, and only a real flip sends a
 #     message; turning the show off forces it dark at once
@@ -1388,14 +1606,17 @@ assert sorted(btn_sent(x.BUTTON_NOTES, x.LED_OFF)) == sorted(x.BUTTON_NOTES)
 assert ("note", sm84.toggle_note, x.LED_OFF) in sent     # forced off by full_clear()
 assert sm84.last_led == x.LED_OFF
 
-# 85. switching ON never clears anything: the cross-clear runs only on a True -> False flip
+# 85. switching ON reaches the other device's toggle LED and nothing else: the full clear
+#     runs only on a True -> False flip, so an ON flip leaves the rest of the other device's
+#     frame to its next tick()
 one_sent.clear(); sent.clear()
 state85 = x.ShowState(False)
 sm85 = x.MiniRenderer(cfg, cc, note, state=state85)
 so85 = x.OneRenderer(cfg, one_default, one_cc, one_note, one_raw, state=state85)
 sm85.on_midi([0x90, sm85.toggle_note, 127])              # switched on from the Mini
 assert sm85.enabled is True and so85.enabled is True
-assert one_sent == []                                    # the One was not touched
+assert one_sent == [("note", so85.toggle_note, x.LED_ON)]   # only the One's toggle LED
+assert so85.last_toggle_led == x.LED_ON
 
 one_sent.clear(); sent.clear()
 state85b = x.ShowState(False)
@@ -1403,7 +1624,7 @@ sm85b = x.MiniRenderer(cfg, cc, note, state=state85b)
 so85b = x.OneRenderer(cfg, one_default, one_cc, one_note, one_raw, state=state85b)
 so85b.on_midi([0x90, so85b.toggle_note, 127])            # switched on from the One
 assert sm85b.enabled is True and so85b.enabled is True
-assert sent == []                                        # the Mini was not touched
+assert sent == [("note", sm85b.toggle_note, x.LED_BLINK)]   # only the Mini's toggle LED
 
 # 86. per-device suspension stays per-device: the main loop suspends one device by calling
 #     clear_output(suspending=True) on it without touching the shared flag, so the other
@@ -1424,8 +1645,8 @@ assert (list(sm86.current), sm86.bar_top, sm86.bar_bottom,
         list(sm86.last_button), sm86.last_led) == mini_before
 assert sm86.enabled is True and so86.enabled is True     # the shared flag is untouched
 
-# 87. switching ON from the One reaches the Mini's toggle LED: a False -> True flip pushes
-#     nothing across, so the Mini's own tick() has to bring its LED in line
+# 87. switching ON from the One puts the Mini's toggle LED on from the press alone, with no
+#     tick() of the Mini's in between, and a following tick() resends nothing
 one_sent.clear(); sent.clear()
 state87 = x.ShowState(False)
 sm87 = x.MiniRenderer(cfg, cc, note, state=state87)
@@ -1434,10 +1655,12 @@ sm87.on_connected()
 assert sm87.last_led == x.LED_OFF
 sent.clear()
 so87.on_midi([0x90, so87.toggle_note, 127])              # pressed on the One only
-assert sm87.enabled is True and sent == []               # the flip alone reaches no Mini LED
-sm87.tick(0.03, lv, 1.0, 1.0)
+assert sm87.enabled is True
 assert sm87.last_led == x.LED_BLINK
 assert ("note", sm87.toggle_note, x.LED_BLINK) in sent
+sent.clear()
+sm87.tick(0.03, lv, 1.0, 1.0)
+assert ("note", sm87.toggle_note, x.LED_BLINK) not in sent   # already in line, not resent
 
 # 88. the same call site puts the LED out again, and the tick still renders nothing while off
 sent.clear()
@@ -1636,5 +1859,203 @@ one_sent.clear()
 rcc.on_midi([0x90, rcc.toggle_note, 127])                   # toggle off -> _clear_all -> _clear_rows
 assert rcc.channel_strip_line == 0
 assert all(rcc.last_button.get(n) == x.LED_OFF for n in rcc.channel_strip_line_notes)
+
+# ---------------------------------------------------------------------------
+# two devices, suspended: the toggle LEDs stay in sync without any tick()
+# ---------------------------------------------------------------------------
+
+# 101. while the show is suspended (the display is asleep) the main loop calls no tick() at
+#      all, so every toggle LED has to be correct from the button press alone -- on both
+#      devices and in both directions. No tick() runs anywhere in this block after the
+#      suspension is entered.
+# the module-level `cc`/`note` sinks are shadowed by loop variables in the blocks above
+def mini_cc(c, v): sent.append(("cc", c, v))
+def mini_note(n, v): sent.append(("note", n, v))
+
+def _suspended_pair():
+    """A connected, rendering Mini+One pair on one flag, put into display-off suspension."""
+    state = x.ShowState(True)
+    mini = x.MiniRenderer(cfg, mini_cc, mini_note, state=state)
+    one = x.OneRenderer(cfg, one_default, one_cc, one_note, one_raw, state=state)
+    mini.on_connected(); one.on_connected()
+    for _ in range(3):
+        mini.tick(0.03, [1.0]*8, 1.0, 1.0)
+        one.tick(0.5, [1.0]*8, 1.0, 1.0, 1.0, 1.0, 1.0)
+    mini.clear_output(suspending=True); one.clear_output(suspending=True)
+    # suspension entry: the Mini's LED is left blinking in hardware, the One's forced solid
+    assert mini.last_led == x.LED_BLINK and one.last_toggle_led == x.LED_ON
+    return mini, one
+
+def _toggle_notes(msgs, note_number):
+    return [v for (kind, n, v) in msgs if kind == "note" and n == note_number]
+
+# (a) pressed on the One: OFF then ON again, both devices correct after each press
+sm101, so101 = _suspended_pair()
+sent.clear(); one_sent.clear()
+so101.on_midi([0x90, so101.toggle_note, 127])                    # ON -> OFF
+assert sm101.enabled is False and so101.enabled is False
+assert sm101.last_led == x.LED_OFF and _toggle_notes(sent, sm101.toggle_note) == [x.LED_OFF]
+assert so101.last_toggle_led == x.LED_OFF and _toggle_notes(one_sent, so101.toggle_note) == [x.LED_OFF]
+
+sent.clear(); one_sent.clear()
+so101.on_midi([0x90, so101.toggle_note, 127])                    # OFF -> ON
+assert sm101.enabled is True and so101.enabled is True
+assert sm101.last_led == x.LED_BLINK and _toggle_notes(sent, sm101.toggle_note) == [x.LED_BLINK]
+assert so101.last_toggle_led == x.LED_ON and _toggle_notes(one_sent, so101.toggle_note) == [x.LED_ON]
+
+# (b) pressed on the Mini: the same, in both directions
+sm101b, so101b = _suspended_pair()
+sent.clear(); one_sent.clear()
+sm101b.on_midi([0x90, sm101b.toggle_note, 127])                  # ON -> OFF
+assert sm101b.enabled is False and so101b.enabled is False
+assert sm101b.last_led == x.LED_OFF and _toggle_notes(sent, sm101b.toggle_note) == [x.LED_OFF]
+assert so101b.last_toggle_led == x.LED_OFF and _toggle_notes(one_sent, so101b.toggle_note) == [x.LED_OFF]
+
+sent.clear(); one_sent.clear()
+sm101b.on_midi([0x90, sm101b.toggle_note, 127])                  # OFF -> ON
+assert sm101b.enabled is True and so101b.enabled is True
+assert sm101b.last_led == x.LED_BLINK and _toggle_notes(sent, sm101b.toggle_note) == [x.LED_BLINK]
+assert so101b.last_toggle_led == x.LED_ON and _toggle_notes(one_sent, so101b.toggle_note) == [x.LED_ON]
+
+# 102. an ON pressed while suspended does not fight the main loop's suspension entry: the
+#      loop clears `suspended` when the flag goes off and so re-enters suspension on the ON,
+#      calling clear_output(suspending=True) again -- which must find both LEDs already in
+#      their suspended-ON state and send nothing further
+sent.clear(); one_sent.clear()
+sm101.clear_output(suspending=True); so101.clear_output(suspending=True)
+assert _toggle_notes(sent, sm101.toggle_note) == []              # still blinking in hardware
+assert _toggle_notes(one_sent, so101.toggle_note) == []          # still solid
+assert sm101.last_led == x.LED_BLINK and so101.last_toggle_led == x.LED_ON
+
+# 103. the One's blink resumes cleanly from lit once ticking starts again after an ON that
+#      arrived while suspended, rather than flicking off for a frame first: _set_toggle_led
+#      restarts the blink from the ON phase (so101b was switched on but never re-suspended,
+#      unlike so101 above -- clear_output(suspending=True) deliberately resets to the OFF
+#      phase instead, see test 79b(c))
+one_sent.clear()
+so101b.tick(0.05, [0]*8, 0.0, 0.0)                               # sub-period dt: no flip yet
+assert so101b.last_toggle_led == x.LED_ON
+so101b.tick(0.45, [0]*8, 0.0, 0.0)                               # first full 0.5 s period
+assert so101b.last_toggle_led == x.LED_OFF
+
+# ---------------------------------------------------------------------------
+# the Mini's Layer LEDs on connect
+# ---------------------------------------------------------------------------
+
+# 104. connect clears BOTH Layer LEDs before lighting the configured one. The Mini blinks a
+#      Layer LED in hardware once told to, so one left blinking by an earlier run configured
+#      with the other `toggle_button` keeps blinking beside the real indicator unless this
+#      process turns it off explicitly -- and it never addresses that note anywhere else.
+def _layer_notes(msgs):
+    return [(n, v) for (kind, n, v) in msgs if kind == "note" and n in (84, 85)]
+
+cfg104b = dict(cfg); cfg104b["toggle_button"] = "B"
+sent.clear()
+sm104b = x.MiniRenderer(cfg104b, mini_cc, mini_note, state=x.ShowState(True))
+sm104b.on_connected()
+assert _layer_notes(sent) == [(84, x.LED_OFF), (85, x.LED_OFF), (85, x.LED_BLINK)], _layer_notes(sent)
+
+cfg104a = dict(cfg); cfg104a["toggle_button"] = "A"
+sent.clear()
+sm104a = x.MiniRenderer(cfg104a, mini_cc, mini_note, state=x.ShowState(True))
+sm104a.on_connected()
+assert _layer_notes(sent) == [(84, x.LED_OFF), (85, x.LED_OFF), (84, x.LED_BLINK)], _layer_notes(sent)
+
+# a hot-plug reconnect repeats exactly that and nothing more
+sent.clear()
+sm104a.on_connected()
+assert _layer_notes(sent) == [(84, x.LED_OFF), (85, x.LED_OFF), (84, x.LED_BLINK)], _layer_notes(sent)
+
+# connecting while off leaves both dark with no redundant third message
+sent.clear()
+sm104off = x.MiniRenderer(cfg104a, mini_cc, mini_note, state=x.ShowState(False))
+sm104off.on_connected()
+assert _layer_notes(sent) == [(84, x.LED_OFF), (85, x.LED_OFF)], _layer_notes(sent)
+assert sm104off.last_led == x.LED_OFF
+
+# ---------------------------------------------------------------------------
+# X-Touch One: the jog wheel as the sensitivity control (what the fader is on the Mini)
+# ---------------------------------------------------------------------------
+
+# 105. CC 60 is a relative encoder, not a position: value 0x41 (65) is one detent clockwise
+#      and 0x01 (1) one detent counter-clockwise, each moving fader_scale by
+#      ONE_SENSITIVITY_STEP, and both ends clamp instead of running past 1.0 / 0.0
+one_sent.clear()
+rj = x.OneRenderer(cfg, one_default, one_cc, one_note, one_raw)
+assert rj.fader_scale == 1.0
+rj.on_midi([0xB0, 60, 65])
+assert abs(rj.fader_scale - (1.0 - x.ONE_SENSITIVITY_STEP)) < 1e-9
+rj.on_midi([0xB0, 60, 1])
+assert abs(rj.fader_scale - 1.0) < 1e-9
+for _ in range(5): rj.on_midi([0xB0, 60, 1])       # already at the top: it stays there
+assert rj.fader_scale == 1.0
+for _ in range(60): rj.on_midi([0xB0, 60, 65])     # a full sweep down and well past it
+assert rj.fader_scale == 0.0
+rj.on_midi([0xB0, 60, 1])                          # and back up one detent from the floor
+assert abs(rj.fader_scale - x.ONE_SENSITIVITY_STEP) < 1e-9
+
+# 106. the wheel scales what is rendered, at the same point in the pipeline the Mini's fader
+#      scales at: 10 detents down and the ring, fed an unchanged loudness, follows it down
+one_sent.clear()
+rj2 = x.OneRenderer(cfg, one_default, one_cc, one_note, one_raw)
+rj2.tick(0.03, [0] * 8, 1.0, 0.0)
+assert [s for s in one_sent if s[0] == "cc" and s[1] == x.RING_CC_ONE][-1][2] - 32 == x.RING_MAX
+for _ in range(10): rj2.on_midi([0xB0, 60, 65])
+scale106 = 1.0 - 10 * x.ONE_SENSITIVITY_STEP
+assert abs(rj2.fader_scale - scale106) < 1e-9
+one_sent.clear()
+for _ in range(x.RING_MAX): rj2.tick(0.03, [0] * 8, 1.0, 0.0)   # decay is 1/frame: let it settle
+ring106 = [s for s in one_sent if s[0] == "cc" and s[1] == x.RING_CC_ONE][-1][2] - 32
+assert ring106 == round(scale106 * x.RING_MAX), ring106
+
+# 107. fader_scale multiplies the level before it becomes an LED count or a meter value, so
+#      halving it halves every level-driven part alike: a band row, the nav-tier bar, the
+#      encoder ring and the hardware level meter
+one_sent.clear()
+rj3 = x.OneRenderer(cfg, one_default, one_cc, one_note, one_raw)
+rj3.tick(0.03, [0] * 8, 1.0, 1.0, band_rel_high=1.0)
+assert (rj3.f1_line, rj3.nav_bar) == (len(rj3.f1_line_notes), len(rj3.nav_tiers))
+assert rj3.ring_current == x.RING_MAX and rj3.last_meter_level == x.ONE_METER_MAX
+
+rj4 = x.OneRenderer(cfg, one_default, one_cc, one_note, one_raw)
+rj4.fader_scale = 0.5
+rj4.tick(0.03, [0] * 8, 1.0, 1.0, band_rel_high=1.0)
+assert rj4.f1_line == round(0.5 * len(rj4.f1_line_notes)) < rj3.f1_line
+assert rj4.nav_bar == round(0.5 * len(rj4.nav_tiers)) < rj3.nav_bar
+assert rj4.ring_current == round(0.5 * x.RING_MAX) < rj3.ring_current
+assert rj4.last_meter_level == round(0.5 * x.ONE_METER_MAX) < rj3.last_meter_level
+
+# 107b. the peak indicator reads the same scaled loudness: at half sensitivity a relative
+#       loudness that lit BPM at full sensitivity no longer reaches the threshold
+one_sent.clear()
+rj5 = x.OneRenderer(cfg, one_default, one_cc, one_note, one_raw)
+rj5.tick(0.03, [0] * 8, 0.0, 1.0)
+assert rj5.peak_on is True
+rj5.fader_scale = 0.5
+for _ in range(20): rj5.tick(0.05, [0] * 8, 0.0, 1.0)
+assert rj5.peak_on is False
+
+# 108. sensitivity is full on construction and again on every reconnect: a relative control
+#      leaves no position to read back, so a hot-plug cannot restore what it was set to
+one_sent.clear()
+rj6 = x.OneRenderer(cfg, one_default, one_cc, one_note, one_raw)
+assert rj6.fader_scale == 1.0
+for _ in range(12): rj6.on_midi([0xB0, 60, 65])
+assert rj6.fader_scale < 1.0
+rj6.on_connected()
+assert rj6.fader_scale == 1.0
+
+# 109. everything else is ignored: a CC 60 value the wheel never sends, CC 60 on another
+#      channel and another CC on this one all leave the sensitivity and the show untouched
+rj7 = x.OneRenderer(cfg, one_default, one_cc, one_note, one_raw)
+rj7.on_midi([0xB0, 60, 1])
+scale109 = rj7.fader_scale
+one_sent.clear()
+for msg in ([0xB0, 60, 64], [0xB0, 60, 0], [0xB0, 60, 127],
+            [0xB1, 60, 65], [0xB2, 60, 1],            # CC 60 on other channels
+            [0xB0, 61, 65], [0xB0, 16, 1]):           # other CCs on this channel
+    rj7.on_midi(msg)
+assert rj7.fader_scale == scale109
+assert one_sent == [] and rj7.enabled is True
 
 print("ALL TESTS PASSED")
