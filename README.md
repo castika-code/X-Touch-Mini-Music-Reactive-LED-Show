@@ -389,7 +389,8 @@ bash ~/xtouch_show/install.sh
 2. 상단 엔코더를 누른 상태에서 전원을 연결합니다.
 3. 엔코더를 돌려 모드를 선택합니다.
 
-> [!WARNING] **주의사항**
+> [!WARNING]
+> **주의사항**
 > * XTouchShow는 X-Touch One 펌웨어 버전 1.10에서 테스트되었습니다.
 > * **MC Standard**와 **MC Logic** 환경에서 호환성이 확인되었습니다.
 > * 다른 MC 모드를 사용할 경우 일부 LED가 점등되지 않을 수 있습니다.
@@ -693,7 +694,8 @@ bash ~/xtouch_show/install.sh
 2. 上部エンコーダーを押したまま電源を接続します。
 3. エンコーダーを回してモードを選択します。
 
-> [!WARNING] **注意事項**
+> [!WARNING]
+> **注意事項**
 > * XTouchShow は X-Touch One ファームウェアバージョン 1.10 でテストされています。
 > * **MC Standard** と **MC Logic** 環境で互換性が確認されています。
 > * 他の MC モードを使用する場合、一部の LED が点灯しないことがあります。
